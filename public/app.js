@@ -107,7 +107,7 @@ function drawCorrections(corrections) {
       ? getInsertionPlacement(anchors)
       : anchors.find((anchor) => anchor.relation === "target") || anchors[0];
     const { x, y, width, height } = placement;
-    const fontSize = Math.max(18, Math.min(
+    let fontSize = Math.max(18, Math.min(
       height * (item.action === "insert" ? .70 : .86),
       canvas.width * .055
     ));
@@ -119,6 +119,15 @@ function drawCorrections(corrections) {
     ctx.lineWidth = Math.max(2, fontSize * .065);
 
     ctx.font = `600 ${fontSize}px Caveat, "Comic Sans MS", cursive`;
+    if (item.action === "replace") {
+      const initialWidth = ctx.measureText(item.replacement).width;
+      const maximumWidth = Math.max(width * 1.08, 1);
+      if (initialWidth > maximumWidth) {
+        fontSize = Math.max(12, fontSize * maximumWidth / initialWidth);
+        ctx.lineWidth = Math.max(2, fontSize * .065);
+        ctx.font = `600 ${fontSize}px Caveat, "Comic Sans MS", cursive`;
+      }
+    }
     ctx.textBaseline = "bottom";
     ctx.shadowColor = "rgba(130, 25, 18, .12)";
     ctx.shadowBlur = 1;

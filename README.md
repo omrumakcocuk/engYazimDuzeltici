@@ -26,9 +26,11 @@ npm start
 
 - Fotoğraf tarayıcıdan sunucuya base64 veri olarak gönderilir.
 - Apple Vision OCR görünür kelimeleri, satırları ve gerçek konumlarını cihaz üzerinde çıkarır.
-- OpenAI Responses API her satırın tam düzeltilmiş cümlesini üretir; modelden koordinat veya parça düzeltmesi istenmez.
+- Açıkça devam isteyen satırlar bir cümle grubunda birleştirilir; her grup OpenAI Responses API ile diğer gruplardan bağımsız düzeltilir.
 - Yerel LanguageTool düzeltilmiş cümleyi kontrol eder ve uygun kural düzeltmelerini uygular.
 - Kod, OCR metni ile kabul edilen son cümle arasında token diff yaparak `insert`, `replace` ve `delete` işlemlerini çıkarır.
+- Harf ve rakamı karıştıran şüpheli OCR okumaları otomatik kelime silme işleminden çıkarılır.
+- `1 year old` ve `2+ years old` yaş uyumu ayrıca deterministik olarak kontrol edilir.
 - Tarayıcıdaki Canvas API, hatalı kısmın üzerine mavi çizgi ve doğrusunu el yazısı stiliyle ekler.
 - API anahtarı hiçbir zaman tarayıcıya gönderilmez.
 
