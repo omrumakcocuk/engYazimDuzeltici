@@ -1,0 +1,14 @@
+{
+  "name": "mektup-duzeltici",
+  "version": "1.0.0",
+  "private": true,
+  "description": "El yazisi Ingilizce mektuplari fotograf uzerinde duzeltir.",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
