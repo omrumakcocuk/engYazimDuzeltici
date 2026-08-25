@@ -4,28 +4,31 @@ El yazısıyla yazılmış İngilizce bir mektubun fotoğrafını analiz eder; y
 
 ## Kurulum
 
-Node.js 20 veya daha yenisi, macOS ve yerel LanguageTool gerekir. Kelime koordinatları macOS ile gelen Apple Vision OCR tarafından ücretsiz ve cihaz üzerinde çıkarılır. LanguageTool kurulumu:
+Node.js 20 veya daha yenisi, macOS ve yerel LanguageTool gerekir. Uygulama aynı fotoğrafı Apple Vision ve Google Cloud Vision ile ayrı ayrı işleyip sonuçları yan yana gösterir. LanguageTool kurulumu:
 
 ```bash
 brew install languagetool
 ```
 
-Harici npm paketi kullanılmadığı için ayrıca `npm install` çalıştırmak gerekmez.
+Bağımlılıkları kurmak için proje klasöründe bir kez `npm install` çalıştırın.
 
 1. `.env.example` dosyasını `.env` adıyla kopyalayın.
 2. `.env` içindeki `OPENAI_API_KEY` değerini kendi OpenAI API anahtarınızla doldurun.
-3. Uygulamayı başlatın:
+3. Google Cloud projesinde Cloud Vision API'yi etkinleştirin. Servis hesabı JSON dosyanızın mutlak yolunu `GOOGLE_APPLICATION_CREDENTIALS` alanına yazın. Alternatif olarak `GOOGLE_CLOUD_VISION_API_KEY` alanına bir `AIza...` API anahtarı yazabilirsiniz. İkisi de boşken Apple sonucu çalışmaya devam eder.
+4. Uygulamayı başlatın:
 
 ```bash
 npm start
 ```
 
-4. Tarayıcıda `http://localhost:3000` adresini açın.
+5. Tarayıcıda `http://localhost:3000` adresini açın.
 
 ## Nasıl çalışır?
 
 - Fotoğraf tarayıcıdan sunucuya base64 veri olarak gönderilir.
-- Apple Vision OCR görünür kelimeleri, satırları ve gerçek konumlarını cihaz üzerinde çıkarır.
+- Apple Vision OCR görünür kelimeleri ve konumlarını cihaz üzerinde çıkarır.
+- Google Cloud Vision `DOCUMENT_TEXT_DETECTION` aynı fotoğraf için ikinci bir kelime ve bounding-box sonucu üretir.
+- İki OCR hattı aynı dilbilgisi, diff, OpenCV temizleme ve Canvas çizim adımlarından bağımsız geçer.
 - Açıkça devam isteyen satırlar bir cümle grubunda birleştirilir; her grup OpenAI Responses API ile diğer gruplardan bağımsız düzeltilir.
 - Yerel LanguageTool düzeltilmiş cümleyi kontrol eder ve uygun kural düzeltmelerini uygular.
 - Kod, OCR metni ile kabul edilen son cümle arasında token diff yaparak `insert`, `replace` ve `delete` işlemlerini çıkarır.

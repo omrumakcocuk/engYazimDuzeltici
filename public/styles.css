@@ -9,6 +9,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body {
   margin: 0;
   min-height: 100vh;
@@ -50,6 +51,20 @@ h1 em { color: var(--accent); font-family: Caveat, cursive; font-style: normal; 
 .text-button { padding: 4px; color: var(--muted); background: none; border: 0; border-bottom: 1px solid currentColor; cursor: pointer; }
 .canvas-wrap { display: grid; place-items: center; max-height: 68vh; overflow: auto; background: #ebeae4; }
 canvas { display: block; max-width: 100%; max-height: 68vh; box-shadow: 0 4px 18px rgba(0,0,0,.14); }
+.comparison-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.result-panel { min-width: 0; padding: 14px; border: 1px solid var(--line); background: #fcfbf7; }
+.result-heading { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 0 0 12px; }
+.result-heading div { display: flex; align-items: center; gap: 8px; }
+.result-heading small { color: var(--muted); }
+.engine-dot { width: 9px; height: 9px; border-radius: 50%; }
+.engine-dot.apple { background: #232b29; }
+.engine-dot.google { background: #4285f4; box-shadow: 7px 0 #ea4335, 14px 0 #fbbc05; margin-right: 14px; }
+.engine-status { min-height: 42px; padding: 11px 0 4px; color: var(--muted); font-size: 12px; line-height: 1.45; }
+.engine-status.error { color: #a83c2c; }
+.panel-download { width: 100%; display: flex; justify-content: space-between; margin-top: 7px; }
+.correction-list.compact { margin-top: 14px; }
+.compact .correction-item { grid-template-columns: 1fr 20px 1fr; gap: 7px; padding: 9px 0; font-size: 12px; }
+.compact .reason { grid-column: 1 / -1; }
 .status { min-height: 25px; padding: 16px 0 0; color: var(--muted); font-size: 14px; }
 .status.error { color: #a83c2c; }
 .actions { display: flex; gap: 12px; justify-content: flex-end; margin-top: 7px; }
@@ -67,6 +82,7 @@ footer i { width: 28px; height: 1px; background: var(--line); }
   h1 { font-size: 46px; }
   .dropzone { min-height: 340px; padding: 28px 15px; }
   .editor { padding: 0 14px 18px; }
+  .comparison-grid { grid-template-columns: 1fr; }
   .actions { flex-direction: column; }
   .wide { width: 100%; }
   .correction-item { grid-template-columns: 1fr 20px 1fr; }

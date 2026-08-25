@@ -2,25 +2,34 @@ const fileInput = document.querySelector("#fileInput");
 const chooseButton = document.querySelector("#chooseButton");
 const changeButton = document.querySelector("#changeButton");
 const correctButton = document.querySelector("#correctButton");
-const downloadButton = document.querySelector("#downloadButton");
 const dropzone = document.querySelector("#dropzone");
 const editor = document.querySelector("#editor");
-const canvas = document.querySelector("#canvas");
-const ctx = canvas.getContext("2d");
 const status = document.querySelector("#status");
-const correctionList = document.querySelector("#correctionList");
 const fileName = document.querySelector("#fileName");
 
+const engines = ["apple", "google"].map((name) => {
+  const canvas = document.querySelector(`#${name}Canvas`);
+  return {
+    name,
+    label: name === "apple" ? "Apple Vision" : "Google Cloud Vision",
+    canvas,
+    ctx: canvas.getContext("2d"),
+    status: document.querySelector(`#${name}Status`),
+    correctionList: document.querySelector(`#${name}CorrectionList`),
+    downloadButton: document.querySelector(`#${name}DownloadButton`),
+    processedImage: null,
+    coordinateSpace: { width: 1000, height: 1000 }
+  };
+});
+
 let sourceImage = null;
-let processedImage = null;
 let sourceDataUrl = "";
-let coordinateSpace = { width: 1000, height: 1000 };
 
 chooseButton.addEventListener("click", () => fileInput.click());
 changeButton.addEventListener("click", () => fileInput.click());
 fileInput.addEventListener("change", () => loadFile(fileInput.files[0]));
 correctButton.addEventListener("click", correctLetter);
-downloadButton.addEventListener("click", downloadResult);
+for (const engine of engines) engine.downloadButton.addEventListener("click", () => downloadResult(engine));
 dropzone.addEventListener("keydown", (event) => {
   if (event.key === "Enter" || event.key === " ") fileInput.click();
 });
@@ -46,85 +55,99 @@ async function loadFile(file) {
 
   sourceDataUrl = await readFile(file);
   sourceImage = await loadImage(sourceDataUrl);
-  processedImage = null;
-  canvas.width = sourceImage.naturalWidth;
-  canvas.height = sourceImage.naturalHeight;
-  drawOriginal();
+  for (const engine of engines) {
+    engine.processedImage = null;
+    engine.canvas.width = sourceImage.naturalWidth;
+    engine.canvas.height = sourceImage.naturalHeight;
+    drawOriginal(engine);
+    engine.status.textContent = "Düzeltmeye hazır.";
+    engine.status.classList.remove("error");
+    engine.downloadButton.hidden = true;
+    engine.correctionList.hidden = true;
+  }
 
   fileName.textContent = file.name;
   dropzone.hidden = true;
   editor.hidden = false;
   correctButton.hidden = false;
-  downloadButton.hidden = true;
-  correctionList.hidden = true;
-  showStatus("Fotoğrafı kontrol etmeye hazırız.");
+  showStatus("Aynı fotoğraf Apple ve Google OCR ile karşılaştırılacak.");
 }
 
 async function correctLetter() {
   if (!sourceDataUrl) return;
   correctButton.disabled = true;
-  downloadButton.hidden = true;
-  correctionList.hidden = true;
-  processedImage = null;
-  drawOriginal();
-  showStatus("El yazısı okunuyor ve İngilizce kontrol ediliyor…");
+  showStatus("İki OCR motoru paralel olarak çalışıyor…");
+  for (const engine of engines) {
+    engine.processedImage = null;
+    drawOriginal(engine);
+    engine.status.textContent = `${engine.label} el yazısını okuyor…`;
+    engine.status.classList.remove("error");
+    engine.downloadButton.hidden = true;
+    engine.correctionList.hidden = true;
+  }
 
+  const outcomes = await Promise.all(engines.map(runEngine));
+  const successful = outcomes.filter(Boolean).length;
+  showStatus(successful === 2
+    ? "İki sonuç hazır; yan yana karşılaştırabilirsin."
+    : successful === 1
+      ? "Bir OCR sonucu hazır; diğer paneldeki kurulum/hata mesajını kontrol et."
+      : "İki OCR motoru da sonuç üretemedi.", successful === 0);
+  correctButton.disabled = false;
+}
+
+async function runEngine(engine) {
   try {
     const response = await fetch("/api/correct", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ image: sourceDataUrl })
+      body: JSON.stringify({ image: sourceDataUrl, ocr_engine: engine.name })
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || "Düzeltme yapılamadı.");
 
-    coordinateSpace = result.coordinate_space || coordinateSpace;
-    if (result.cleaned_image) processedImage = await loadImage(result.cleaned_image);
-    drawOriginal();
-    drawCorrections(result.corrections);
-    renderCorrectionList(result.corrections);
+    engine.coordinateSpace = result.coordinate_space || engine.coordinateSpace;
+    if (result.cleaned_image) engine.processedImage = await loadImage(result.cleaned_image);
+    drawOriginal(engine);
+    drawCorrections(engine, result.corrections);
+    renderCorrectionList(engine, result.corrections);
     const count = result.corrections.length;
-    showStatus(count ? `${count} düzeltme fotoğrafın üzerine işlendi.` : "Mektupta belirgin bir hata bulunamadı.");
-    downloadButton.hidden = false;
+    engine.status.textContent = count
+      ? `${count} düzeltme fotoğrafın üzerine işlendi.`
+      : "Mektupta belirgin bir hata bulunamadı.";
+    engine.downloadButton.hidden = false;
+    return true;
   } catch (error) {
-    showStatus(error.message, true);
-  } finally {
-    correctButton.disabled = false;
+    engine.status.textContent = error.message;
+    engine.status.classList.add("error");
+    return false;
   }
 }
 
-function drawOriginal() {
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.drawImage(processedImage || sourceImage, 0, 0);
+function drawOriginal(engine) {
+  engine.ctx.clearRect(0, 0, engine.canvas.width, engine.canvas.height);
+  engine.ctx.drawImage(engine.processedImage || sourceImage, 0, 0);
 }
 
-function drawCorrections(corrections) {
+function drawCorrections(engine, corrections) {
+  const { ctx, canvas } = engine;
   for (const item of corrections) {
-    const anchors = (item.anchors || []).map(normalizedBoxToCanvas);
+    const anchors = (item.anchors || []).map((anchor) => normalizedBoxToCanvas(engine, anchor));
     if (!anchors.length) continue;
-
     const placement = item.action === "insert"
       ? getInsertionPlacement(anchors)
       : anchors.find((anchor) => anchor.relation === "target") || anchors[0];
     const { x, y, width, height } = placement;
-    let fontSize = Math.max(18, Math.min(
-      height * (item.action === "insert" ? .70 : .86),
-      canvas.width * .055
-    ));
+    let fontSize = Math.max(18, Math.min(height * (item.action === "insert" ? .70 : .86), canvas.width * .055));
 
     ctx.save();
-    ctx.strokeStyle = "#d43f32";
     ctx.fillStyle = "#d43f32";
-    ctx.lineCap = "round";
-    ctx.lineWidth = Math.max(2, fontSize * .065);
-
     ctx.font = `600 ${fontSize}px Caveat, "Comic Sans MS", cursive`;
     if (item.action === "replace") {
       const initialWidth = ctx.measureText(item.replacement).width;
       const maximumWidth = Math.max(width * 1.08, 1);
       if (initialWidth > maximumWidth) {
         fontSize = Math.max(12, fontSize * maximumWidth / initialWidth);
-        ctx.lineWidth = Math.max(2, fontSize * .065);
         ctx.font = `600 ${fontSize}px Caveat, "Comic Sans MS", cursive`;
       }
     }
@@ -132,39 +155,30 @@ function drawCorrections(corrections) {
     ctx.shadowColor = "rgba(130, 25, 18, .12)";
     ctx.shadowBlur = 1;
     const textWidth = ctx.measureText(item.replacement).width;
-    const isShortInsertion = item.action === "insert"
-      && item.replacement.trim().length <= 3;
-    const fitsInline = item.action === "insert"
-      && (!placement.between || isShortInsertion || textWidth + fontSize * .15 <= width);
-    const labelX = item.action === "insert"
-      ? x - textWidth / 2
-      : x + (width - textWidth) / 2;
+    const isShortInsertion = item.action === "insert" && item.replacement.trim().length <= 3;
+    const fitsInline = item.action === "insert" && (!placement.between || isShortInsertion || textWidth + fontSize * .15 <= width);
+    const labelX = item.action === "insert" ? x - textWidth / 2 : x + (width - textWidth) / 2;
     const labelY = item.action === "insert" && fitsInline
       ? placement.baseline - height * .04
-      : item.action === "replace"
-        ? y + height * .94
-        : Math.max(fontSize + 3, y - height * .12);
+      : item.action === "replace" ? y + height * .94 : Math.max(fontSize + 3, y - height * .12);
     ctx.fillText(item.replacement, Math.max(2, labelX), labelY);
     ctx.restore();
   }
 }
 
-function normalizedBoxToCanvas(anchor) {
-  const scaleX = canvas.width / coordinateSpace.width;
-  const scaleY = canvas.height / coordinateSpace.height;
+function normalizedBoxToCanvas(engine, anchor) {
   return {
     ...anchor,
-    x: anchor.x * scaleX,
-    y: anchor.y * scaleY,
-    width: anchor.width * scaleX,
-    height: anchor.height * scaleY
+    x: anchor.x * engine.canvas.width / engine.coordinateSpace.width,
+    y: anchor.y * engine.canvas.height / engine.coordinateSpace.height,
+    width: anchor.width * engine.canvas.width / engine.coordinateSpace.width,
+    height: anchor.height * engine.canvas.height / engine.coordinateSpace.height
   };
 }
 
 function getInsertionPlacement(anchors) {
   const left = anchors.find((anchor) => anchor.relation === "left");
   const right = anchors.find((anchor) => anchor.relation === "right");
-
   if (left && right) {
     const leftEdge = left.x + left.width;
     const rightEdge = right.x;
@@ -177,7 +191,6 @@ function getInsertionPlacement(anchors) {
       between: true
     };
   }
-
   const anchor = left || right || anchors[0];
   return {
     x: anchor.relation === "left" ? anchor.x + anchor.width : anchor.x,
@@ -189,21 +202,21 @@ function getInsertionPlacement(anchors) {
   };
 }
 
-function renderCorrectionList(corrections) {
-  correctionList.innerHTML = corrections.map((item) => `
+function renderCorrectionList(engine, corrections) {
+  engine.correctionList.innerHTML = corrections.map((item) => `
     <div class="correction-item">
       <span class="wrong">${item.action === "insert" ? "Eksik" : escapeHtml(item.original)}</span>
       <span>→</span>
       <span class="right">${escapeHtml(item.replacement)}</span>
       <span class="reason">${escapeHtml(item.reason)}</span>
     </div>`).join("");
-  correctionList.hidden = corrections.length === 0;
+  engine.correctionList.hidden = corrections.length === 0;
 }
 
-function downloadResult() {
+function downloadResult(engine) {
   const link = document.createElement("a");
-  link.download = "duzeltilmis-mektup.png";
-  link.href = canvas.toDataURL("image/png", 1);
+  link.download = `duzeltilmis-mektup-${engine.name}.png`;
+  link.href = engine.canvas.toDataURL("image/png", 1);
   link.click();
 }
 

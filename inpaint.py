@@ -1,5 +1,6 @@
 import base64
 import json
+import math
 import sys
 
 import cv2
@@ -31,16 +32,29 @@ def main():
         if not target:
             continue
 
-        x = int(target["x"] / 1000 * image_width)
-        y = int(target["y"] / 1000 * image_height)
-        width = max(1, int(target["width"] / 1000 * image_width))
-        height = max(1, int(target["height"] / 1000 * image_height))
+        try:
+            values = [float(target[key]) for key in ("x", "y", "width", "height")]
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not all(math.isfinite(value) for value in values):
+            continue
+
+        x = int(values[0] / 1000 * image_width)
+        y = int(values[1] / 1000 * image_height)
+        width = max(1, int(values[2] / 1000 * image_width))
+        height = max(1, int(values[3] / 1000 * image_height))
         pad_x = max(3, int(width * 0.06))
         pad_y = max(3, int(height * 0.12))
-        x1, y1 = max(0, x - pad_x), max(0, y - pad_y)
-        x2, y2 = min(image_width, x + width + pad_x), min(image_height, y + height + pad_y)
+        x1 = min(image_width, max(0, x - pad_x))
+        y1 = min(image_height, max(0, y - pad_y))
+        x2 = min(image_width, max(0, x + width + pad_x))
+        y2 = min(image_height, max(0, y + height + pad_y))
+        if x1 >= x2 or y1 >= y2:
+            continue
 
         region = image[y1:y2, x1:x2]
+        if region.size == 0 or region.ndim != 3 or region.shape[2] != 3:
+            continue
         blue, green, red = cv2.split(region)
         blue_ink = (
             (blue.astype(np.int16) - red.astype(np.int16) > 14)

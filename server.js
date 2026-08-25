@@ -4,6 +4,7 @@ const path = require("node:path");
 const os = require("node:os");
 const { execFile, spawn } = require("node:child_process");
 const { promisify } = require("node:util");
+const { ImageAnnotatorClient } = require("@google-cloud/vision");
 
 const execFileAsync = promisify(execFile);
 
@@ -21,6 +22,7 @@ const INPAINT_SCRIPT = path.join(__dirname, "inpaint.py");
 const PYTHON_BIN = path.join(__dirname, ".venv", "bin", "python3");
 const ENGLISH_VARIANT = process.env.ENGLISH_VARIANT || "en-US";
 let languageToolProcess = null;
+let googleVisionClient = null;
 
 const groupCorrectionSchema = {
   type: "object",
@@ -91,25 +93,33 @@ async function correctLetter(req, res) {
     return json(res, 400, { error: "Gecerli bir JPEG, PNG veya WebP fotograf yukleyin." });
   }
 
+  const ocrEngine = body.ocr_engine === "google" ? "google" : "apple";
   let words;
   try {
-    words = selectHandwrittenWords(await recognizeWords(body.image));
+    const recognizedWords = ocrEngine === "google"
+      ? await recognizeGoogleWords(body.image)
+      : await recognizeWords(body.image);
+    words = ocrEngine === "google"
+      ? selectGoogleHandwrittenWords(recognizedWords)
+      : selectHandwrittenWords(recognizedWords);
   } catch (error) {
     console.error(error);
-    return json(res, 500, { error: "Yerel Apple OCR fotografi okuyamadi." });
+    const fallbackMessage = ocrEngine === "google"
+      ? "Google Cloud Vision fotografi okuyamadi."
+      : "Yerel Apple OCR fotografi okuyamadi.";
+    return json(res, 500, { error: error.message || fallbackMessage });
   }
   if (!words.length) return json(res, 422, { error: "Fotografta okunabilir el yazisi bulunamadi." });
 
   try {
     const ocrLines = buildOcrLines(words);
     const sentenceGroups = buildSentenceGroups(ocrLines);
-    const corrections = [];
-
-    for (const group of sentenceGroups) {
+    const correctionGroups = await mapWithConcurrency(sentenceGroups, 3, async (group) => {
       const correctedText = await correctSentenceGroup(body.image, group);
       const validated = await validateWithLanguageTool(correctedText);
-      corrections.push(...diffLineToCorrections(group, validated));
-    }
+      return diffLineToCorrections(group, validated);
+    });
+    const corrections = correctionGroups.flat();
 
     const grammaticallyAligned = enforceParallelCorrectionForms(corrections, sentenceGroups);
     const deterministicCorrections = detectDeterministicGrammar(words);
@@ -128,12 +138,123 @@ async function correctLetter(req, res) {
       summary: `${sentenceGroups.length} independent sentence group(s) checked.`,
       corrections: anchoredCorrections,
       cleaned_image: cleanedImage,
+      ocr_engine: ocrEngine,
       coordinate_space: { width: 1000, height: 1000 }
     });
   } catch (error) {
     console.error(error);
     return json(res, 502, { error: error.message || "Analiz sonucu islenemedi." });
   }
+}
+
+async function recognizeGoogleWords(dataUrl) {
+  const apiKey = process.env.GOOGLE_CLOUD_VISION_API_KEY;
+  const credentialsPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+  if (!apiKey && !credentialsPath) {
+    throw new Error(".env dosyasinda GOOGLE_APPLICATION_CREDENTIALS veya GOOGLE_CLOUD_VISION_API_KEY eksik.");
+  }
+  const match = dataUrl.match(/^data:image\/(jpeg|png|webp);base64,(.+)$/s);
+  if (!match) throw new Error("Gecersiz fotograf verisi.");
+
+  if (credentialsPath) {
+    const resolvedCredentialsPath = path.resolve(credentialsPath);
+    if (!fs.existsSync(resolvedCredentialsPath)) {
+      throw new Error("GOOGLE_APPLICATION_CREDENTIALS ile belirtilen JSON dosyasi bulunamadi.");
+    }
+    if (!googleVisionClient) googleVisionClient = new ImageAnnotatorClient({ keyFilename: resolvedCredentialsPath });
+    try {
+      const [result] = await googleVisionClient.documentTextDetection({
+        image: { content: Buffer.from(match[2], "base64") },
+        imageContext: { languageHints: ["en"] }
+      }, { timeout: 20000 });
+      return parseGoogleVisionWords(result);
+    } catch (error) {
+      throw new Error(`Google Cloud Vision kimlik dogrulama/istek hatasi: ${error.message}`);
+    }
+  }
+
+  const response = await fetch(`https://vision.googleapis.com/v1/images:annotate?key=${encodeURIComponent(apiKey)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      requests: [{
+        image: { content: match[2] },
+        features: [{ type: "DOCUMENT_TEXT_DETECTION" }],
+        imageContext: { languageHints: ["en"] }
+      }]
+    })
+  });
+  const data = await response.json();
+  const apiError = data.error || data.responses?.[0]?.error;
+  if (!response.ok || apiError) {
+    throw new Error(apiError?.message || "Google Cloud Vision istegi basarisiz oldu.");
+  }
+  return parseGoogleVisionWords(data.responses?.[0]);
+}
+
+function parseGoogleVisionWords(annotationResponse) {
+  const pages = annotationResponse?.fullTextAnnotation?.pages || [];
+  const words = [];
+  for (const page of pages) {
+    const pageWidth = Math.max(1, Number(page.width) || 1);
+    const pageHeight = Math.max(1, Number(page.height) || 1);
+    for (const block of page.blocks || []) {
+      for (const paragraph of block.paragraphs || []) {
+        for (const googleWord of paragraph.words || []) {
+          const text = (googleWord.symbols || []).map((symbol) => symbol.text || "").join("").trim();
+          if (!text) continue;
+          const pixelVertices = googleWord.boundingBox?.vertices || [];
+          const unitVertices = googleWord.boundingBox?.normalizedVertices || [];
+          const usesNormalizedVertices = pixelVertices.length === 0 && unitVertices.length > 0;
+          const vertices = usesNormalizedVertices ? unitVertices : pixelVertices;
+          if (!vertices.length) continue;
+          const normalizedVertices = usesNormalizedVertices
+            ? vertices.map((vertex) => ({ x: (vertex.x || 0) * pageWidth, y: (vertex.y || 0) * pageHeight }))
+            : vertices.map((vertex) => ({ x: vertex.x || 0, y: vertex.y || 0 }));
+          const xs = normalizedVertices.map((vertex) => vertex.x);
+          const ys = normalizedVertices.map((vertex) => vertex.y);
+          const left = Math.min(...xs);
+          const top = Math.min(...ys);
+          const right = Math.max(...xs);
+          const bottom = Math.max(...ys);
+          words.push({
+            id: `w${words.length}`,
+            text,
+            x: left / pageWidth * 1000,
+            y: top / pageHeight * 1000,
+            width: (right - left) / pageWidth * 1000,
+            height: (bottom - top) / pageHeight * 1000,
+            confidence: Number(googleWord.confidence) || 0
+          });
+        }
+      }
+    }
+  }
+  return words;
+}
+
+function selectGoogleHandwrittenWords(words) {
+  const documentLines = groupOcrWordsIntoLines(words).filter((line) => {
+    const meaningfulWords = line.words.filter((word) => /^[A-Za-z']{2,}$/.test(word.text));
+    return meaningfulWords.length >= 2;
+  });
+  const documentWords = documentLines.flatMap((line) => line.words)
+    .filter((word) => /^[A-Za-z0-9']+$/.test(word.text));
+  return selectHandwrittenWords(documentWords.length >= 2 ? documentWords : words);
+}
+
+async function mapWithConcurrency(items, concurrency, worker) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  async function run() {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await worker(items[index], index);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, run));
+  return results;
 }
 
 async function inpaintImage(dataUrl, corrections) {
@@ -236,6 +357,7 @@ async function correctSentenceGroup(image, group) {
       "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
       "Content-Type": "application/json"
     },
+    signal: AbortSignal.timeout(45000),
     body: JSON.stringify({
       model: process.env.OPENAI_MODEL || "gpt-5.4-mini",
       store: false,
@@ -1034,5 +1156,8 @@ module.exports = {
   normalizeOcrNumber,
   mergeCorrections,
   recognizeWords,
+  recognizeGoogleWords,
+  parseGoogleVisionWords,
+  selectGoogleHandwrittenWords,
   selectHandwrittenWords
 };

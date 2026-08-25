@@ -10,12 +10,48 @@ const {
   isSafeCorrection,
   mergeCorrections,
   normalizeOcrNumber,
+  parseGoogleVisionWords,
+  selectGoogleHandwrittenWords,
   selectHandwrittenWords
 } = require("../server");
 
 function word(id, text, x, y = 100) {
   return { id, text, x, y, width: 60, height: 30 };
 }
+
+test("Google Vision word polygons are normalized to the shared coordinate space", () => {
+  const words = parseGoogleVisionWords({
+    fullTextAnnotation: {
+      pages: [{
+        width: 2000,
+        height: 1000,
+        blocks: [{ paragraphs: [{ words: [{
+          confidence: 0.94,
+          symbols: [{ text: "H" }, { text: "i" }],
+          boundingBox: {
+            vertices: [{ x: 200, y: 100 }, { x: 500, y: 100 }, { x: 500, y: 200 }, { x: 200, y: 200 }],
+            normalizedVertices: []
+          }
+        }] }] }]
+      }]
+    }
+  });
+  assert.deepEqual(words, [{
+    id: "w0", text: "Hi", x: 100, y: 100, width: 150, height: 100, confidence: 0.94
+  }]);
+});
+
+test("Google OCR ignores keyboard rows before selecting handwriting", () => {
+  const words = [
+    word("k1", "A", 10, 20), word("k2", "S", 80, 20), word("k3", "D", 150, 20),
+    word("w1", "my", 10, 400), word("w2", "sister", 90, 400), word("w3", "reads", 190, 400),
+    word("w4", "she", 10, 470), word("w5", "has", 90, 470), word("w6", "books", 170, 470)
+  ];
+  assert.deepEqual(
+    selectGoogleHandwrittenWords(words).map((item) => item.id),
+    ["w1", "w2", "w3", "w4", "w5", "w6"]
+  );
+});
 
 test("a clearly unfinished physical line joins the next line", () => {
   const lines = [

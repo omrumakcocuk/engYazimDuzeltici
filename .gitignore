@@ -1,4 +1,6 @@
 .env
+google-vision-credentials.json
+service-account.json
 .DS_Store
 node_modules/
 .venv/

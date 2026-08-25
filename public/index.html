@@ -39,13 +39,26 @@
           </div>
           <button id="changeButton" class="text-button" type="button">Değiştir</button>
         </div>
-        <div class="canvas-wrap"><canvas id="canvas"></canvas></div>
+        <div class="comparison-grid">
+          <article class="result-panel">
+            <div class="result-heading"><div><span class="engine-dot apple"></span><strong>Apple Vision</strong></div><small>Yerel OCR</small></div>
+            <div class="canvas-wrap"><canvas id="appleCanvas"></canvas></div>
+            <div id="appleStatus" class="engine-status" aria-live="polite"></div>
+            <button id="appleDownloadButton" class="button secondary panel-download" type="button" hidden>Apple sonucunu indir <span>↓</span></button>
+            <div id="appleCorrectionList" class="correction-list compact" hidden></div>
+          </article>
+          <article class="result-panel">
+            <div class="result-heading"><div><span class="engine-dot google"></span><strong>Google Cloud Vision</strong></div><small>Bulut OCR</small></div>
+            <div class="canvas-wrap"><canvas id="googleCanvas"></canvas></div>
+            <div id="googleStatus" class="engine-status" aria-live="polite"></div>
+            <button id="googleDownloadButton" class="button secondary panel-download" type="button" hidden>Google sonucunu indir <span>↓</span></button>
+            <div id="googleCorrectionList" class="correction-list compact" hidden></div>
+          </article>
+        </div>
         <div id="status" class="status" aria-live="polite"></div>
         <div class="actions">
-          <button id="correctButton" class="button primary wide" type="button">Mektubu düzelt <span>→</span></button>
-          <button id="downloadButton" class="button secondary wide" type="button" hidden>Fotoğrafı indir <span>↓</span></button>
+          <button id="correctButton" class="button primary wide" type="button">İki OCR ile düzelt <span>→</span></button>
         </div>
-        <div id="correctionList" class="correction-list" hidden></div>
       </div>
     </section>
 
