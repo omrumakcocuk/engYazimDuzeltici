@@ -7,11 +7,11 @@ const editor = document.querySelector("#editor");
 const status = document.querySelector("#status");
 const fileName = document.querySelector("#fileName");
 
-const providers = ["openai", "gemini"].map((name) => {
+const providers = ["gemini"].map((name) => {
   const canvas = document.querySelector(`#${name}Canvas`);
   return {
     name,
-    label: name === "openai" ? "OpenAI GPT" : "Google Gemini",
+    label: "Google Gemini",
     canvas,
     ctx: canvas.getContext("2d"),
     status: document.querySelector(`#${name}Status`),
@@ -70,13 +70,13 @@ async function loadFile(file) {
   dropzone.hidden = true;
   editor.hidden = false;
   correctButton.hidden = false;
-  showStatus("Aynı Google OCR metni GPT ve Gemini ile karşılaştırılacak.");
+  showStatus("Google OCR metni Gemini ile kontrol edilecek.");
 }
 
 async function correctLetter() {
   if (!sourceDataUrl) return;
   correctButton.disabled = true;
-  showStatus("Google OCR okunuyor; GPT ve Gemini paralel çalışıyor…");
+  showStatus("Google OCR okunuyor; Gemini metni kontrol ediyor…");
   for (const provider of providers) {
     provider.processedImage = null;
     drawOriginal(provider);
@@ -86,13 +86,8 @@ async function correctLetter() {
     provider.correctionList.hidden = true;
   }
 
-  const outcomes = await Promise.all(providers.map(runProvider));
-  const successful = outcomes.filter(Boolean).length;
-  showStatus(successful === 2
-    ? "İki sonuç hazır; yan yana karşılaştırabilirsin."
-    : successful === 1
-      ? "Bir yapay zekâ sonucu hazır; diğer paneldeki API ayarını kontrol et."
-      : "İki yapay zekâ sağlayıcısı da sonuç üretemedi.", successful === 0);
+  const successful = await runProvider(providers[0]);
+  showStatus(successful ? "Gemini sonucu hazır." : "Gemini sonuç üretemedi.", !successful);
   correctButton.disabled = false;
 }
 
@@ -107,7 +102,11 @@ async function runProvider(provider) {
     if (!response.ok) throw new Error(result.error || "Düzeltme yapılamadı.");
 
     provider.coordinateSpace = result.coordinate_space || provider.coordinateSpace;
-    if (result.cleaned_image) provider.processedImage = await loadImage(result.cleaned_image);
+    if (result.cleaned_image) {
+      provider.processedImage = await loadImage(result.cleaned_image);
+      provider.canvas.width = provider.processedImage.naturalWidth;
+      provider.canvas.height = provider.processedImage.naturalHeight;
+    }
     drawOriginal(provider);
     drawCorrections(provider, result.corrections);
     renderCorrectionList(provider, result.corrections);
@@ -136,34 +135,82 @@ function drawCorrections(engine, corrections) {
     if (!anchors.length) continue;
     const placement = item.action === "insert"
       ? getInsertionPlacement(anchors)
-      : anchors.find((anchor) => anchor.relation === "target") || anchors[0];
-    const { x, y, width, height } = placement;
-    let fontSize = Math.max(18, Math.min(height * (item.action === "insert" ? .70 : .86), canvas.width * .055));
+      : item.action === "rewrite_line"
+        ? getRewritePlacement(anchors)
+        : anchors.find((anchor) => anchor.relation === "target") || anchors[0];
+    let { x, y, width, height } = placement;
+    if (item.action === "replace" && Number.isFinite(placement.slotX) && Number.isFinite(placement.slotWidth)) {
+      // Neighbouring whitespace may be borrowed, but the replacement must
+      // remain centred on the erased word. Using the entire asymmetric slot
+      // was the reason words such as “movies” visibly jumped sideways.
+      const targetCenter = placement.x + placement.width / 2;
+      const slotLeft = placement.slotX;
+      const slotRight = placement.slotX + placement.slotWidth;
+      const symmetricRoom = Math.max(
+        placement.width / 2,
+        Math.min(targetCenter - slotLeft, slotRight - targetCenter)
+      );
+      x = targetCenter - symmetricRoom;
+      width = symmetricRoom * 2;
+    }
+    const lineHeight = placement.lineHeight || height;
+    const maximumFont = Math.max(12, Math.min(canvas.width, canvas.height) * .038);
+    let fontSize = Math.max(9, Math.min(
+      lineHeight * (item.action === "insert" ? .72 : .84),
+      maximumFont
+    ));
 
     ctx.save();
     ctx.fillStyle = "#d43f32";
     ctx.font = `600 ${fontSize}px Caveat, "Comic Sans MS", cursive`;
-    if (item.action === "replace") {
-      const initialWidth = ctx.measureText(item.replacement).width;
-      const maximumWidth = Math.max(width * 1.08, 1);
-      if (initialWidth > maximumWidth) {
-        fontSize = Math.max(12, fontSize * maximumWidth / initialWidth);
-        ctx.font = `600 ${fontSize}px Caveat, "Comic Sans MS", cursive`;
-      }
-    }
+    // Fit phrases by reducing the font modestly. Never stretch short words and
+    // never apply OCR polygon angles: handwriting polygons are too noisy for
+    // reliable rotation, especially on a curved sheet.
     ctx.textBaseline = "bottom";
     ctx.shadowColor = "rgba(130, 25, 18, .12)";
     ctx.shadowBlur = 1;
-    const textWidth = ctx.measureText(item.replacement).width;
-    const isShortInsertion = item.action === "insert" && item.replacement.trim().length <= 3;
-    const fitsInline = item.action === "insert" && (!placement.between || isShortInsertion || textWidth + fontSize * .15 <= width);
-    const labelX = item.action === "insert" ? x - textWidth / 2 : x + (width - textWidth) / 2;
-    const labelY = item.action === "insert" && fitsInline
+    const maximumTextWidth = Math.max(1, width * .96);
+    const mayFitInsideSlot = item.action === "replace"
+      || item.action === "rewrite_line"
+      || (item.action === "insert" && placement.between);
+    let textWidth = ctx.measureText(item.replacement).width;
+    if (mayFitInsideSlot && textWidth > maximumTextWidth) {
+      fontSize = Math.max(8, fontSize * Math.max(.72, maximumTextWidth / textWidth));
+      ctx.font = `600 ${fontSize}px Caveat, "Comic Sans MS", cursive`;
+      textWidth = ctx.measureText(item.replacement).width;
+    }
+    const horizontalScale = mayFitInsideSlot
+      ? Math.min(1, Math.max(.84, maximumTextWidth / Math.max(1, textWidth)))
+      : 1;
+    const paintedWidth = textWidth * horizontalScale;
+    const labelX = item.action === "insert" ? x - paintedWidth / 2 : x + (width - paintedWidth) / 2;
+    const labelY = item.action === "insert" && placement.between
       ? placement.baseline - height * .04
-      : item.action === "replace" ? y + height * .94 : Math.max(fontSize + 3, y - height * .12);
-    ctx.fillText(item.replacement, Math.max(2, labelX), labelY);
+      : (item.action === "replace" || item.action === "rewrite_line")
+        ? (placement.lineBaseline || (y + height)) - lineHeight * .025
+        : Math.max(fontSize + 3, y + height * .08);
+    ctx.translate(Math.max(2, labelX), labelY);
+    ctx.scale(horizontalScale, 1);
+    ctx.fillText(item.replacement, 0, 0);
     ctx.restore();
   }
+}
+
+function getRewritePlacement(anchors) {
+  const left = Math.min(...anchors.map((anchor) => anchor.x));
+  const top = Math.min(...anchors.map((anchor) => anchor.y));
+  const right = Math.max(...anchors.map((anchor) => anchor.x + anchor.width));
+  const bottom = Math.max(...anchors.map((anchor) => anchor.y + anchor.height));
+  const baselines = anchors.map((anchor) => anchor.lineBaseline).filter(Number.isFinite);
+  const lineHeights = anchors.map((anchor) => anchor.lineHeight).filter(Number.isFinite);
+  return {
+    x: left,
+    y: top,
+    width: right - left,
+    height: bottom - top,
+    lineBaseline: averageFinite(baselines) || bottom,
+    lineHeight: averageFinite(lineHeights) || bottom - top
+  };
 }
 
 function normalizedBoxToCanvas(engine, anchor) {
@@ -172,7 +219,19 @@ function normalizedBoxToCanvas(engine, anchor) {
     x: anchor.x * engine.canvas.width / engine.coordinateSpace.width,
     y: anchor.y * engine.canvas.height / engine.coordinateSpace.height,
     width: anchor.width * engine.canvas.width / engine.coordinateSpace.width,
-    height: anchor.height * engine.canvas.height / engine.coordinateSpace.height
+    height: anchor.height * engine.canvas.height / engine.coordinateSpace.height,
+    lineBaseline: Number.isFinite(anchor.lineBaseline)
+      ? anchor.lineBaseline * engine.canvas.height / engine.coordinateSpace.height
+      : undefined,
+    lineHeight: Number.isFinite(anchor.lineHeight)
+      ? anchor.lineHeight * engine.canvas.height / engine.coordinateSpace.height
+      : undefined,
+    slotX: Number.isFinite(anchor.slotX)
+      ? anchor.slotX * engine.canvas.width / engine.coordinateSpace.width
+      : undefined,
+    slotWidth: Number.isFinite(anchor.slotWidth)
+      ? anchor.slotWidth * engine.canvas.width / engine.coordinateSpace.width
+      : undefined
   };
 }
 
@@ -187,7 +246,10 @@ function getInsertionPlacement(anchors) {
       y: (left.y + right.y) / 2,
       width: Math.max(1, rightEdge - leftEdge),
       height: (left.height + right.height) / 2,
-      baseline: ((left.y + left.height) + (right.y + right.height)) / 2,
+      baseline: averageFinite([left.lineBaseline, right.lineBaseline])
+        || ((left.y + left.height) + (right.y + right.height)) / 2,
+      lineBaseline: averageFinite([left.lineBaseline, right.lineBaseline]),
+      lineHeight: averageFinite([left.lineHeight, right.lineHeight]),
       between: true
     };
   }
@@ -200,6 +262,11 @@ function getInsertionPlacement(anchors) {
     baseline: anchor.y + anchor.height,
     between: false
   };
+}
+
+function averageFinite(values) {
+  const finite = values.filter(Number.isFinite);
+  return finite.length ? finite.reduce((sum, value) => sum + value, 0) / finite.length : undefined;
 }
 
 function renderCorrectionList(engine, corrections) {

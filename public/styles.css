@@ -39,12 +39,12 @@ body {
 .canvas-wrap { display: grid; place-items: center; min-height: 280px; max-height: 72vh; overflow: auto; background: #f1f1f1; }
 canvas { display: block; max-width: 100%; max-height: 68vh; box-shadow: 0 4px 18px rgba(0,0,0,.14); }
 .comparison-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.comparison-grid.single-result { grid-template-columns: minmax(0, 1fr); }
 .result-panel { min-width: 0; padding: 10px; border: 1px solid var(--line); background: #fff; }
 .result-heading { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 0 0 12px; }
 .result-heading div { display: flex; align-items: center; gap: 8px; }
 .result-heading small { color: var(--muted); }
 .engine-dot { width: 9px; height: 9px; border-radius: 50%; }
-.engine-dot.openai { background: #10a37f; }
 .engine-dot.gemini { background: #4285f4; box-shadow: 7px 0 #a855f7; margin-right: 7px; }
 .engine-status { min-height: 42px; padding: 11px 0 4px; color: var(--muted); font-size: 12px; line-height: 1.45; }
 .engine-status.error { color: #a83c2c; }

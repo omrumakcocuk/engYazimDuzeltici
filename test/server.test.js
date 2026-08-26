@@ -2,11 +2,15 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const {
+  attachOcrAnchors,
   buildSentenceGroups,
+  detectAdvancedGrammar,
   detectDeterministicGrammar,
+  diffLineToCorrections,
   enforceParallelCorrectionForms,
   filterLikelyOcrArtifacts,
   filterProtectedProperNames,
+  groupOcrWordsIntoLines,
   isSafeCorrection,
   mergeCorrections,
   normalizeOcrNumber,
@@ -14,6 +18,61 @@ const {
   selectGoogleHandwrittenWords,
   selectHandwrittenWords
 } = require("../server");
+
+function sentence(texts) {
+  return [{
+    id: "group_1",
+    words: texts.map((text, index) => word(`s${index}`, text, index * 80)),
+    text: texts.join(" ")
+  }];
+}
+
+test("inpainting anchors are clipped between neighboring text-line centers", () => {
+  const words = [
+    { id: "upper", text: "wrong", x: 100, y: 100, width: 90, height: 60 },
+    { id: "lower", text: "keep", x: 100, y: 220, width: 80, height: 30 }
+  ];
+  const [correction] = attachOcrAnchors([{
+    action: "replace", original: "wrong", replacement: "right",
+    target_id: "upper", left_id: "", right_id: ""
+  }], words);
+  assert.equal(correction.anchors[0].safeTop, 0);
+  assert.ok(correction.anchors[0].safeBottom > 170);
+  assert.ok(correction.anchors[0].safeBottom < 200);
+  assert.equal(correction.anchors[0].lineBaseline, 160);
+  assert.equal(correction.anchors[0].lineHeight, 60);
+});
+
+test("replacement anchors may use neighboring whitespace without touching words", () => {
+  const words = [
+    { id: "left", text: "we", x: 100, y: 100, width: 40, height: 40 },
+    { id: "target", text: "go", x: 200, y: 100, width: 35, height: 40 },
+    { id: "right", text: "to", x: 300, y: 100, width: 30, height: 40 }
+  ];
+  const [correction] = attachOcrAnchors([{
+    action: "replace", original: "go", replacement: "went",
+    target_id: "target", left_id: "", right_id: ""
+  }], words);
+  const anchor = correction.anchors[0];
+  assert.equal(anchor.slotX, 170);
+  assert.equal(anchor.slotWidth, 97.5);
+  assert.ok(anchor.slotX > words[0].x + words[0].width);
+  assert.ok(anchor.slotX + anchor.slotWidth < words[2].x);
+});
+
+test("correction anchors use the target word baseline on a curved handwritten line", () => {
+  const words = [
+    { id: "left", text: "we", x: 100, y: 120, width: 40, height: 35, layoutLine: "curve" },
+    { id: "target", text: "go", x: 200, y: 105, width: 45, height: 35, layoutLine: "curve" },
+    { id: "right", text: "home", x: 310, y: 115, width: 80, height: 35, layoutLine: "curve" }
+  ];
+  const [correction] = attachOcrAnchors([{
+    action: "replace", original: "go", replacement: "went",
+    target_id: "target", left_id: "", right_id: ""
+  }], words);
+  assert.equal(correction.anchors[0].lineBaseline, 140);
+  assert.equal(correction.anchors[0].baselineSlope, undefined);
+});
 
 function word(id, text, x, y = 100) {
   return { id, text, x, y, width: 60, height: 30 };
@@ -51,6 +110,163 @@ test("Google OCR ignores keyboard rows before selecting handwriting", () => {
     selectGoogleHandwrittenWords(words).map((item) => item.id),
     ["w1", "w2", "w3", "w4", "w5", "w6"]
   );
+});
+
+test("a one-word wrapped ending remains part of the handwritten document", () => {
+  const words = [
+    word("w1", "She", 120, 100), word("w2", "finished", 220, 100),
+    word("w3", "the", 400, 100), word("w4", "day", 500, 100),
+    word("w5", "before", 120, 155)
+  ];
+  assert.deepEqual(selectGoogleHandwrittenWords(words).map((item) => item.text), [
+    "She", "finished", "the", "day", "before"
+  ]);
+});
+
+test("perspective does not discard smaller handwriting at the top of a long letter", () => {
+  const words = [
+    { id: "top1", text: "She", x: 100, y: 100, width: 45, height: 13 },
+    { id: "top2", text: "have", x: 160, y: 100, width: 55, height: 13 },
+    { id: "top3", text: "cats", x: 230, y: 100, width: 45, height: 13 },
+    { id: "bottom1", text: "They", x: 100, y: 700, width: 90, height: 42 },
+    { id: "bottom2", text: "study", x: 210, y: 700, width: 110, height: 42 },
+    { id: "bottom3", text: "hard", x: 340, y: 700, width: 90, height: 42 }
+  ];
+  assert.deepEqual(
+    selectGoogleHandwrittenWords(words).map((item) => item.id),
+    words.map((item) => item.id)
+  );
+});
+
+test("slanted handwriting remains grouped into complete visual lines", () => {
+  const words = [
+    { id: "w0", text: "Likes", x: 70, y: 210, width: 207, height: 226 },
+    { id: "w1", text: "she", x: 327, y: 171, width: 135, height: 210 },
+    { id: "w2", text: "football", x: 515, y: 106, width: 254, height: 236 },
+    { id: "w3", text: "His", x: 85, y: 539, width: 125, height: 226 },
+    { id: "w4", text: "name", x: 252, y: 486, width: 176, height: 238 },
+    { id: "w5", text: "is", x: 460, y: 456, width: 81, height: 216 },
+    { id: "w6", text: "john", x: 563, y: 406, width: 184, height: 241 },
+    { id: "w7", text: "Cena", x: 762, y: 359, width: 182, height: 239 }
+  ];
+  assert.equal(groupOcrWordsIntoLines(words).length, 2);
+  assert.deepEqual(
+    selectGoogleHandwrittenWords(words).map((item) => item.id).sort(),
+    words.map((item) => item.id).sort()
+  );
+});
+
+test("a pure word-order error changes only the words that moved", () => {
+  const line = {
+    id: "group_1",
+    lineIds: ["line_1"],
+    words: [word("w1", "Likes", 10), word("w2", "She", 90), word("w3", "football", 160)]
+  };
+  assert.deepEqual(
+    diffLineToCorrections(line, "She likes football").map(({ original, replacement, target_id }) => ({
+      original, replacement, target_id
+    })),
+    [
+      { original: "Likes", replacement: "She", target_id: "w1" },
+      { original: "She", replacement: "likes", target_id: "w2" }
+    ]
+  );
+});
+
+test("a fronted lexical verb is deterministically reordered before a pronoun subject", () => {
+  const words = [word("w1", "Likes", 10), word("w2", "She", 90), word("w3", "football", 160)];
+  const corrections = detectDeterministicGrammar(words);
+  assert.deepEqual(
+    corrections.map(({ original, replacement, target_id }) => ({ original, replacement, target_id })),
+    [
+      { original: "Likes", replacement: "She", target_id: "w1" },
+      { original: "She", replacement: "likes", target_id: "w2" }
+    ]
+  );
+  assert.equal(corrections.some((item) => item.target_id === "w3"), false);
+});
+
+test("a word-order error is found after another clause on the same physical line", () => {
+  const words = [
+    word("w1", "they", 10), word("w2", "study", 80), word("w3", "hard", 150),
+    word("w4", "Likes", 230), word("w5", "he", 310), word("w6", "football", 370)
+  ];
+  const byTarget = new Map(detectDeterministicGrammar(words).map((item) => [item.target_id, item.replacement]));
+  assert.equal(byTarget.get("w4"), "He");
+  assert.equal(byTarget.get("w5"), "likes");
+  assert.equal(byTarget.has("w6"), false);
+});
+
+test("a past marker tolerates one-character OCR noise in an irregular verb", () => {
+  const words = [
+    word("w1", "Last", 10), word("w2", "month", 80), word("w3", "they", 160),
+    word("w4", "buty", 230), word("w5", "three", 300), word("w6", "books", 380)
+  ];
+  const correction = detectDeterministicGrammar(words).find((item) => item.target_id === "w4");
+  assert.equal(correction.replacement, "bought");
+});
+
+test("past-tense OCR tolerance does not reinterpret nearby function words or pronouns", () => {
+  const words = [
+    word("w1", "Yesterday", 10), word("w2", "she", 100),
+    word("w3", "go", 170), word("w4", "to", 230), word("w5", "school", 290)
+  ];
+  const byTarget = new Map(detectDeterministicGrammar(words).map((item) => [item.target_id, item.replacement]));
+  assert.equal(byTarget.get("w3"), "went");
+  assert.equal(byTarget.has("w2"), false);
+  assert.equal(byTarget.has("w4"), false);
+});
+
+test("a content word is never changed into a nearby function word by fuzzy matching", () => {
+  assert.equal(isSafeCorrection({ action: "replace", original: "go", replacement: "to" }), false);
+});
+
+test("long letters retain line-local high-confidence grammar checks", () => {
+  const words = [
+    word("w1", "She", 10, 100), word("w2", "have", 80, 100), word("w3", "two", 150, 100),
+    word("w4", "cat", 220, 100), word("w5", "Yesterday", 300, 100), word("w6", "we", 390, 100),
+    word("w7", "go", 450, 100), word("w8", "to", 510, 100), word("w9", "school", 570, 100),
+    word("w10", "My", 10, 200), word("w11", "friend", 80, 200), word("w12", "doesn't", 160, 200),
+    word("w13", "enjoys", 240, 200), word("w14", "going", 320, 200), word("w15", "to", 390, 200),
+    word("w16", "library", 450, 200),
+    word("w17", "Their", 10, 300), word("w18", "teacher", 90, 300), word("w19", "were", 180, 300),
+    word("w20", "happy", 250, 300),
+    word("w21", "Last", 10, 400), word("w22", "month", 80, 400), word("w23", "they", 160, 400),
+    word("w24", "buy", 230, 400), word("w25", "three", 300, 400), word("w26", "book", 380, 400)
+  ];
+  const byTarget = new Map(detectDeterministicGrammar(words).map((item) => [item.target_id, item.replacement]));
+  assert.equal(byTarget.get("w2"), "has");
+  assert.equal(byTarget.get("w4"), "cats");
+  assert.equal(byTarget.get("w7"), "went");
+  assert.equal(byTarget.get("w13"), "enjoy");
+  assert.equal(byTarget.get("w19"), "was");
+  assert.equal(byTarget.get("w24"), "bought");
+  assert.equal(byTarget.get("w26"), "books");
+});
+
+test("a misspelled negative auxiliary still forces the following base verb", () => {
+  const words = [
+    word("w1", "My", 10), word("w2", "sister", 80),
+    word("w3", "dont", 160), word("w4", "likes", 230), word("w5", "reading", 300)
+  ];
+  const byTarget = new Map(detectDeterministicGrammar(words).map((item) => [item.target_id, item.replacement]));
+  assert.equal(byTarget.get("w3"), "doesn't");
+  assert.equal(byTarget.get("w4"), "like");
+});
+
+test("a preference rule never pluralizes a similar word on the next physical line", () => {
+  const words = [
+    word("w1", "Likes", 10, 100), word("w2", "She", 90, 100), word("w3", "football", 160, 100),
+    word("w4", "His", 10, 220), word("w5", "name", 90, 220), word("w6", "is", 160, 220), word("w7", "John", 210, 220)
+  ];
+  assert.equal(
+    detectDeterministicGrammar(words).some((item) => item.target_id === "w5"),
+    false
+  );
+});
+
+test("short unrelated words are rejected as unsafe spelling corrections", () => {
+  assert.equal(isSafeCorrection({ action: "replace", original: "name", replacement: "games" }), false);
 });
 
 test("a clearly unfinished physical line joins the next line", () => {
@@ -125,6 +341,19 @@ test("overlapping duplicate OCR readings keep the main word box", () => {
   assert.deepEqual(selectHandwrittenWords(words).map((item) => item.id), ["w1", "w2", "w4"]);
 });
 
+test("a short perspective line is not removed by a taller neighboring line", () => {
+  const words = [
+    { id: "upper0", text: "watching", x: 380, y: 300, width: 105, height: 42 },
+    { id: "upper", text: "movie", x: 500, y: 300, width: 95, height: 42 },
+    { id: "last", text: "Last", x: 500, y: 338, width: 71, height: 12 },
+    { id: "week", text: "week", x: 590, y: 338, width: 84, height: 12 }
+  ];
+  assert.deepEqual(
+    selectHandwrittenWords(words).map((item) => item.id).sort(),
+    ["last", "upper", "upper0", "week"]
+  );
+});
+
 test("a proper name in the sentence is never replaced", () => {
   const groups = [{ words: [word("w1", "My", 10), word("w2", "name", 70), word("w3", "is", 150), word("w4", "Arda", 200)] }];
   const corrections = [
@@ -132,6 +361,18 @@ test("a proper name in the sentence is never replaced", () => {
     { action: "replace", target_id: "w4", original: "Arda", replacement: "Ardal" }
   ];
   assert.deepEqual(filterProtectedProperNames(corrections, groups).map((item) => item.target_id), ["w1"]);
+});
+
+test("the missing verb after my name survives a curved-line grouping failure", () => {
+  const words = [
+    { ...word("w1", "My", 100, 110), layoutLine: "split_a" },
+    { ...word("w2", "name", 180, 100), layoutLine: "split_a" },
+    { ...word("w3", "Ahmet", 330, 82), layoutLine: "split_b" }
+  ];
+  const correction = detectDeterministicGrammar(words)
+    .find((item) => item.action === "insert" && item.replacement === "is");
+  assert.equal(correction?.left_id, "w2");
+  assert.equal(correction?.right_id, "w3");
 });
 
 test("coordinated activities use matching gerund forms", () => {
@@ -186,6 +427,27 @@ test("multiple objects use a plural object pronoun", () => {
   ];
   const correction = detectDeterministicGrammar(words).find((item) => item.target_id === "w7");
   assert.equal(correction.replacement, "them");
+});
+
+test("a plural count in one sentence never changes a pronoun in the next sentence", () => {
+  const first = sentence(["I", "have", "lived", "here", "for", "three", "years"])[0];
+  const second = sentence(["If", "it", "rains", "we", "will", "stay", "home"])[0];
+  first.id = "duration";
+  second.id = "conditional";
+  first.words.forEach((item, index) => { item.id = `duration_${index}`; item.layoutLine = "line_1"; });
+  second.words.forEach((item, index) => { item.id = `conditional_${index}`; item.layoutLine = "line_2"; });
+  const corrections = detectDeterministicGrammar([...first.words, ...second.words], [first, second]);
+  assert.equal(corrections.some((item) => item.original.toLowerCase() === "it" && item.replacement === "them"), false);
+});
+
+test("an age expression never changes a later conditional it into them without AI grouping", () => {
+  const words = [
+    word("w1", "I", 10), word("w2", "am", 70), word("w3", "fifteen", 130),
+    word("w4", "years", 240), word("w5", "old", 330), word("w6", "If", 410),
+    word("w7", "it", 470), word("w8", "rains", 530)
+  ];
+  const corrections = detectDeterministicGrammar(words);
+  assert.equal(corrections.some((item) => item.target_id === "w7" && item.replacement === "them"), false);
 });
 
 test("yesterday triggers a nearby irregular past-tense correction", () => {
@@ -261,4 +523,52 @@ test("irregular auxiliary agreement corrections pass the safety filter", () => {
   assert.equal(isSafeCorrection({ action: "replace", original: "is", replacement: "are" }), true);
   assert.equal(isSafeCorrection({ action: "replace", original: "dont", replacement: "doesn't" }), true);
   assert.equal(isSafeCorrection({ action: "replace", original: "go", replacement: "went" }), true);
+});
+
+test("B1-B2 corrections stay inside one logical sentence", () => {
+  const groups = [
+    ...sentence(["The", "film", "was", "more", "better", "than", "expected"]),
+    { ...sentence(["Although", "I", "was", "tired", "but", "I", "finished", "homework"])[0], id: "group_2" },
+    { ...sentence(["The", "book", "who", "I", "borrowed", "was", "interesting"])[0], id: "group_3" }
+  ];
+  groups.forEach((group, groupIndex) => group.words.forEach((item, wordIndex) => {
+    item.id = `g${groupIndex}_${wordIndex}`;
+  }));
+  const byOriginal = new Map(detectAdvancedGrammar(groups).map((item) => [item.original, item.replacement]));
+  assert.equal(byOriginal.get("more"), "");
+  assert.equal(byOriginal.get("but"), "");
+  assert.equal(byOriginal.get("who"), "that");
+});
+
+test("joined handwriting for and I live is repaired as one phrase", () => {
+  const group = sentence(["I", "am", "fifteen", "years", "old", "an", "ilive", "in", "Ankara"])[0];
+  const correction = detectAdvancedGrammar([group]).find((item) => item.action === "rewrite_line");
+  assert.equal(correction.original, "an ilive");
+  assert.equal(correction.replacement, "and I live");
+});
+
+test("conditionals and reported speech receive complete high-confidence corrections", () => {
+  const groups = [
+    ...sentence(["If", "it", "will", "rain", "tomorrow", "we", "stay", "at", "home"]),
+    { ...sentence(["If", "I", "knew", "about", "it", "I", "would", "have", "came", "earlier"])[0], id: "group_2" },
+    { ...sentence(["She", "told", "me", "that", "she", "has", "finished", "it"])[0], id: "group_3" }
+  ];
+  groups.forEach((group, groupIndex) => group.words.forEach((item, wordIndex) => {
+    item.id = `c${groupIndex}_${wordIndex}`;
+  }));
+  const corrections = detectAdvancedGrammar(groups);
+  const replacements = new Map(corrections.filter((item) => item.action === "replace")
+    .map((item) => [item.original, item.replacement]));
+  const rewrites = new Map(corrections.filter((item) => item.action === "rewrite_line")
+    .map((item) => [item.original, item.replacement]));
+  assert.equal(rewrites.get("will rain"), "rains");
+  assert.equal(rewrites.get("knew about"), "had known about");
+  assert.equal(replacements.get("came"), "come");
+  assert.equal(replacements.get("has"), "had");
+  assert.equal(rewrites.get("we stay"), "we will stay");
+});
+
+test("a plural subject followed by has and an adjective uses be", () => {
+  const corrections = detectAdvancedGrammar(sentence(["We", "has", "happy", "because", "weather", "were", "beautiful"]));
+  assert.equal(corrections.find((item) => item.original === "has")?.replacement, "were");
 });

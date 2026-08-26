@@ -27,14 +27,7 @@
           </div>
           <button id="changeButton" class="text-button" type="button">Değiştir</button>
         </div>
-        <div class="comparison-grid">
-          <article class="result-panel">
-            <div class="result-heading"><div><span class="engine-dot openai"></span><strong>OpenAI GPT</strong></div><small>Google OCR</small></div>
-            <div class="canvas-wrap"><canvas id="openaiCanvas"></canvas></div>
-            <div id="openaiStatus" class="engine-status" aria-live="polite"></div>
-            <button id="openaiDownloadButton" class="button secondary panel-download" type="button" hidden>GPT sonucunu indir <span>↓</span></button>
-            <div id="openaiCorrectionList" class="correction-list compact output-details" hidden></div>
-          </article>
+        <div class="comparison-grid single-result">
           <article class="result-panel">
             <div class="result-heading"><div><span class="engine-dot gemini"></span><strong>Google Gemini</strong></div><small>Google OCR</small></div>
             <div class="canvas-wrap"><canvas id="geminiCanvas"></canvas></div>
@@ -45,7 +38,7 @@
         </div>
         <div id="status" class="status" aria-live="polite"></div>
         <div class="actions">
-          <button id="correctButton" class="button primary wide" type="button">GPT ve Gemini ile düzelt <span>→</span></button>
+          <button id="correctButton" class="button primary wide" type="button">Gemini ile düzelt <span>→</span></button>
         </div>
       </div>
     </section>

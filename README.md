@@ -4,7 +4,7 @@ El yazısıyla yazılmış İngilizce bir mektubun fotoğrafını analiz eder; y
 
 ## Kurulum
 
-Node.js 20 veya daha yenisi ve yerel LanguageTool gerekir. Google Cloud Vision tarafından okunan aynı metin OpenAI GPT ve Google Gemini ile ayrı ayrı düzeltilip yan yana gösterilir. LanguageTool kurulumu:
+Node.js 20 veya daha yenisi ve yerel LanguageTool gerekir. Google Cloud Vision tarafından okunan metin Google Gemini ile düzeltilir. LanguageTool kurulumu:
 
 ```bash
 brew install languagetool
@@ -13,24 +13,24 @@ brew install languagetool
 Bağımlılıkları kurmak için proje klasöründe bir kez `npm install` çalıştırın.
 
 1. `.env.example` dosyasını `.env` adıyla kopyalayın.
-2. `.env` içindeki `OPENAI_API_KEY` değerini kendi OpenAI API anahtarınızla doldurun.
-3. Google AI Studio'dan oluşturduğunuz anahtarı `GEMINI_API_KEY` alanına yazın.
-4. Google Cloud projesinde Cloud Vision API'yi etkinleştirin. Servis hesabı JSON dosyanızın mutlak yolunu `GOOGLE_APPLICATION_CREDENTIALS` alanına yazın. Alternatif olarak `GOOGLE_CLOUD_VISION_API_KEY` alanına bir `AIza...` API anahtarı yazabilirsiniz.
-5. Uygulamayı başlatın:
+2. Google AI Studio'dan oluşturduğunuz anahtarı `GEMINI_API_KEY` alanına yazın.
+3. Google Cloud projesinde Cloud Vision API'yi etkinleştirin. Servis hesabı JSON dosyanızın mutlak yolunu `GOOGLE_APPLICATION_CREDENTIALS` alanına yazın. Alternatif olarak `GOOGLE_CLOUD_VISION_API_KEY` alanına bir `AIza...` API anahtarı yazabilirsiniz.
+4. Uygulamayı başlatın:
 
 ```bash
 npm start
 ```
 
-6. Tarayıcıda `http://localhost:3000` adresini açın.
+5. Tarayıcıda `http://localhost:3000` adresini açın.
 
 ## Nasıl çalışır?
 
 - Fotoğraf tarayıcıdan sunucuya base64 veri olarak gönderilir.
 - Google Cloud Vision `DOCUMENT_TEXT_DETECTION` görünür kelimeleri ve bounding-box koordinatlarını bir kez üretir.
-- Aynı OCR metni ve aynı fotoğraf OpenAI GPT ile Google Gemini'ye paralel gönderilir.
-- İki yapay zekâ sonucu aynı dilbilgisi, diff, OpenCV temizleme ve Canvas çizim adımlarından bağımsız geçer.
-- Açıkça devam isteyen satırlar bir cümle grubunda birleştirilir; her grup OpenAI Responses API ile diğer gruplardan bağımsız düzeltilir.
+- OCR metni ve fotoğraf Google Gemini'ye gönderilir.
+- Fotoğraf önce OpenCV ile kâğıt kenarlarından kırpılır ve mümkünse perspektifi düzeltilir; kenar güvenle bulunamazsa orijinal korunur.
+- Gemini sonucu dilbilgisi, diff, OpenCV temizleme ve Canvas çizim adımlarından geçer.
+- Açıkça devam isteyen satırlar bir cümle grubunda birleştirilir; her grup Gemini ile diğer gruplardan bağımsız düzeltilir.
 - Yerel LanguageTool düzeltilmiş cümleyi kontrol eder ve uygun kural düzeltmelerini uygular.
 - Kod, OCR metni ile kabul edilen son cümle arasında token diff yaparak `insert`, `replace` ve `delete` işlemlerini çıkarır.
 - Harf ve rakamı karıştıran şüpheli OCR okumaları otomatik kelime silme işleminden çıkarılır.
