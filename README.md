@@ -29,7 +29,7 @@ npm start
 - Google Cloud Vision `DOCUMENT_TEXT_DETECTION` görünür kelimeleri ve bounding-box koordinatlarını bir kez üretir.
 - OCR metni ve fotoğraf Google Gemini'ye gönderilir.
 - Fotoğraf önce OpenCV ile kâğıt kenarlarından kırpılır ve mümkünse perspektifi düzeltilir; kenar güvenle bulunamazsa orijinal korunur.
-- Gemini sonucu dilbilgisi, diff, OpenCV temizleme ve Canvas çizim adımlarından geçer.
+- Gemini önce Google Vision koordinatlarını kullanarak fiziksel satırları ve mantıksal cümleleri düzenler; sonuç sonra dilbilgisi, diff, OpenCV temizleme ve Canvas çizim adımlarından geçer.
 - Açıkça devam isteyen satırlar bir cümle grubunda birleştirilir; her grup Gemini ile diğer gruplardan bağımsız düzeltilir.
 - Yerel LanguageTool düzeltilmiş cümleyi kontrol eder ve uygun kural düzeltmelerini uygular.
 - Kod, OCR metni ile kabul edilen son cümle arasında token diff yaparak `insert`, `replace` ve `delete` işlemlerini çıkarır.
@@ -38,4 +38,4 @@ npm start
 - Tarayıcıdaki Canvas API, hatalı kısmın üzerine mavi çizgi ve doğrusunu el yazısı stiliyle ekler.
 - API anahtarı hiçbir zaman tarayıcıya gönderilmez.
 
-Model koordinatları görselden tahmin ettiği için özellikle eğik, bulanık veya gölgeli fotoğraflarda yerleşim birkaç piksel sapabilir. En iyi sonuç için fotoğrafı kâğıda dik açıyla ve iyi ışıkta çekin.
+Koordinatlı düzen geçersiz kalırsa Gemini görsel yedeği, o da başarısız olursa geometrik düzen kullanılır. Yazı yerleşimi Google Vision kutularına dayandığı için en iyi sonuç için fotoğrafı kâğıda dik açıyla ve iyi ışıkta çekin.

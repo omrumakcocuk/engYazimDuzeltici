@@ -14,6 +14,7 @@ const {
   isSafeCorrection,
   mergeCorrections,
   normalizeOcrNumber,
+  organizeSentenceGroupsWithGemini,
   parseGoogleVisionWords,
   selectGoogleHandwrittenWords,
   selectHandwrittenWords
@@ -98,6 +99,64 @@ test("Google Vision word polygons are normalized to the shared coordinate space"
   assert.deepEqual(words, [{
     id: "w0", text: "Hi", x: 100, y: 100, width: 150, height: 100, confidence: 0.94
   }]);
+});
+
+test("Gemini uses coordinate layout before visual fallback", async () => {
+  const originalFetch = global.fetch;
+  const requests = [];
+  global.fetch = async (_url, options) => {
+    const request = JSON.parse(options.body);
+    requests.push(request);
+    return {
+      ok: true,
+      json: async () => ({
+        candidates: [{ content: { parts: [{ text: JSON.stringify({
+          lines: [{ word_ids: ["w1", "w2"] }],
+          sentences: [{ word_ids: ["w1", "w2"] }]
+        }) }] } }]
+      })
+    };
+  };
+  try {
+    const result = await organizeSentenceGroupsWithGemini(
+      "data:image/jpeg;base64,AA==",
+      [word("w1", "She", 100), word("w2", "reads", 180)]
+    );
+    assert.equal(result.source, "coordinates");
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].contents[0].parts.length, 1);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test("an incomplete coordinate layout retries with the photograph", async () => {
+  const originalFetch = global.fetch;
+  let requestCount = 0;
+  global.fetch = async (_url, options) => {
+    requestCount += 1;
+    const request = JSON.parse(options.body);
+    const wordIds = request.contents[0].parts.length === 1 ? ["w1"] : ["w1", "w2"];
+    return {
+      ok: true,
+      json: async () => ({
+        candidates: [{ content: { parts: [{ text: JSON.stringify({
+          lines: [{ word_ids: wordIds }],
+          sentences: [{ word_ids: wordIds }]
+        }) }] } }]
+      })
+    };
+  };
+  try {
+    const result = await organizeSentenceGroupsWithGemini(
+      "data:image/jpeg;base64,AA==",
+      [word("w1", "She", 100), word("w2", "reads", 180)]
+    );
+    assert.equal(result.source, "visual");
+    assert.equal(requestCount, 2);
+  } finally {
+    global.fetch = originalFetch;
+  }
 });
 
 test("Google OCR ignores keyboard rows before selecting handwriting", () => {
@@ -448,6 +507,27 @@ test("an age expression never changes a later conditional it into them without A
   ];
   const corrections = detectDeterministicGrammar(words);
   assert.equal(corrections.some((item) => item.target_id === "w7" && item.replacement === "them"), false);
+});
+
+test("an age followed by and it never changes it into them", () => {
+  const words = [
+    word("w1", "I", 10), word("w2", "am", 70), word("w3", "15", 130),
+    word("w4", "years", 200), word("w5", "old", 290), word("w6", "and", 360),
+    word("w7", "it", 430), word("w8", "is", 490), word("w9", "cold", 540)
+  ];
+  const corrections = detectDeterministicGrammar(words);
+  assert.equal(corrections.some((item) => item.target_id === "w7" && item.replacement === "them"), false);
+});
+
+test("a duration never changes a later conditional it into them", () => {
+  const words = [
+    word("w1", "I", 10), word("w2", "have", 70), word("w3", "lived", 140),
+    word("w4", "here", 230), word("w5", "for", 310), word("w6", "three", 380),
+    word("w7", "years", 470), word("w8", "If", 10, 180), word("w9", "it", 70, 180),
+    word("w10", "rains", 140, 180)
+  ];
+  const corrections = detectDeterministicGrammar(words);
+  assert.equal(corrections.some((item) => item.target_id === "w9" && item.replacement === "them"), false);
 });
 
 test("yesterday triggers a nearby irregular past-tense correction", () => {

@@ -113,8 +113,19 @@ async function correctLetter(req, res) {
     words = organized.words;
     const sentenceGroups = organized.groups;
     const correctionGroups = await mapWithConcurrency(sentenceGroups, 3, async (group) => {
-      const correctedText = await correctSentenceGroup(workingImage, group, aiProvider);
-      const validated = await validateWithLanguageTool(correctedText);
+      let correctedText;
+      try {
+        correctedText = await correctSentenceGroup(workingImage, group, aiProvider);
+      } catch (error) {
+        throw stageError(`Gemini cümle düzeltmesi (${group.id})`, error);
+      }
+
+      let validated;
+      try {
+        validated = await validateWithLanguageTool(correctedText);
+      } catch (error) {
+        throw stageError(`LanguageTool doğrulaması (${group.id})`, error);
+      }
       return diffLineToCorrections(group, validated);
     });
     const corrections = correctionGroups.flat();
@@ -132,7 +143,12 @@ async function correctLetter(req, res) {
     );
 
     const anchoredCorrections = attachOcrAnchors(finalCorrections, words);
-    const cleanedImage = await inpaintImage(workingImage, anchoredCorrections);
+    let cleanedImage;
+    try {
+      cleanedImage = await inpaintImage(workingImage, anchoredCorrections);
+    } catch (error) {
+      throw stageError("OpenCV görsel temizleme", error);
+    }
 
     return json(res, 200, {
       summary: `${sentenceGroups.length} independent sentence group(s) checked.`,
@@ -140,13 +156,21 @@ async function correctLetter(req, res) {
       cleaned_image: cleanedImage,
       ocr_engine: "google",
       ai_provider: aiProvider,
+      sentence_layout: organized.source,
       paper_cropped: workingImage !== body.image,
       coordinate_space: { width: 1000, height: 1000 }
     });
   } catch (error) {
     console.error(error);
-    return json(res, 502, { error: error.message || "Analiz sonucu islenemedi." });
+    return json(res, 502, { error: error.message || "Analiz sonucu işlenemedi." });
   }
+}
+
+function stageError(stage, error) {
+  const detail = error instanceof Error ? error.message : String(error || "işlem başarısız oldu");
+  const wrapped = new Error(`${stage}: ${detail}`, { cause: error });
+  wrapped.stage = stage;
+  return wrapped;
 }
 
 async function cropPaperImage(dataUrl) {
@@ -464,7 +488,7 @@ async function correctSentenceGroup(image, group) {
 async function organizeSentenceGroupsWithGemini(image, words) {
   const fallback = () => {
     const lines = buildOcrLines(words);
-    return { words, groups: buildSentenceGroups(lines) };
+    return { words, groups: buildSentenceGroups(lines), source: "geometry" };
   };
   if (words.length < 2) return fallback();
   const match = image.match(/^data:image\/(jpeg|png|webp);base64,(.+)$/s);
@@ -473,13 +497,12 @@ async function organizeSentenceGroupsWithGemini(image, words) {
   const tokens = words.map((word) =>
     `[${word.id}] ${word.text} @(${Math.round(word.x)},${Math.round(word.y)},${Math.round(word.width)},${Math.round(word.height)})`
   ).join("\n");
-  const requestLayout = async (includeImage, timeout) => {
+  const requestLayout = async (includeImage) => {
     const parts = [{ text: `Arrange these OCR tokens. Coordinates are normalized x,y,width,height:\n${tokens}` }];
     if (includeImage) parts.push({ inlineData: { mimeType: `image/${match[1]}`, data: match[2] } });
     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-goog-api-key": process.env.GEMINI_API_KEY },
-      signal: AbortSignal.timeout(timeout),
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: [
           "Organize OCR word IDs from one handwritten English letter.",
@@ -494,7 +517,7 @@ async function organizeSentenceGroupsWithGemini(image, words) {
         generationConfig: {
           temperature: 0,
           maxOutputTokens: 4096,
-          thinkingConfig: { thinkingLevel: "minimal" },
+          thinkingConfig: { thinkingLevel: "low" },
           responseMimeType: "application/json",
           responseJsonSchema: sentenceLayoutSchema
         }
@@ -506,33 +529,55 @@ async function organizeSentenceGroupsWithGemini(image, words) {
     if (!raw) throw new Error("Gemini bos cumle duzeni dondurdu.");
     return JSON.parse(raw);
   };
-  try {
-    let layout;
-    try {
-      // Visual ordering proved more reliable for curved handwritten pages.
-      // Use it first so a slow coordinate-only attempt does not delay every
-      // request. The JPEG has already been cropped and size-limited.
-      layout = await requestLayout(true, 30000);
-    } catch (visualError) {
-      console.warn("Gemini gorsel cumle duzeni kullanilamadi; koordinatlarla tekrar deneniyor:", visualError.message);
-      layout = await requestLayout(false, 20000);
-    }
+  const normalizeLayout = (layout) => {
     const byId = new Map(words.map((word) => [word.id, word]));
     const validIds = new Set(byId.keys());
-    const flattenUnique = (items) => {
+    const normalizeLayoutItems = (items, name) => {
+      if (!Array.isArray(items) || !items.length) throw new Error(`Gemini ${name} listesi bos.`);
       const seen = new Set();
-      return (items || []).map((item) => ({
-        word_ids: (item.word_ids || []).filter((id) => validIds.has(id) && !seen.has(id) && seen.add(id))
-      })).filter((item) => item.word_ids.length);
+      const normalized = items.map((item) => {
+        if (!item || !Array.isArray(item.word_ids) || !item.word_ids.length) {
+          throw new Error(`Gemini ${name} grubunda kelime ID'si eksik.`);
+        }
+        const wordIds = item.word_ids.map((id) => {
+          if (!validIds.has(id) || seen.has(id)) {
+            throw new Error(`Gemini ${name} listesinde gecersiz veya tekrarli kelime ID'si var.`);
+          }
+          seen.add(id);
+          return id;
+        });
+        return { word_ids: wordIds };
+      });
+      if (seen.size !== validIds.size) {
+        throw new Error(`Gemini ${name} listesi OCR kelimelerinin tamamini kapsamiyor.`);
+      }
+      return normalized;
     };
-    const lines = flattenUnique(layout.lines);
-    const sentences = flattenUnique(layout.sentences);
-    const lineCoverage = lines.reduce((sum, line) => sum + line.word_ids.length, 0) / words.length;
-    const sentenceCoverage = sentences.reduce((sum, sentence) => sum + sentence.word_ids.length, 0) / words.length;
-    if (lineCoverage < .82 || sentenceCoverage < .82 || !sentences.length) {
-      console.warn("Gemini cumle duzeni eksik kaldi; geometrik siralama kullaniliyor.");
-      return fallback();
+    return {
+      byId,
+      lines: normalizeLayoutItems(layout.lines, "satir"),
+      sentences: normalizeLayoutItems(layout.sentences, "cumle")
+    };
+  };
+  try {
+    let normalizedLayout;
+    let source;
+    try {
+      // Coordinates keep the model focused on the supplied OCR layout and
+      // avoid asking it to estimate positions from a curved photograph.
+      normalizedLayout = normalizeLayout(await requestLayout(false));
+      source = "coordinates";
+    } catch (coordinateError) {
+      console.warn("Gemini koordinatli cumle duzeni kullanilamadi; gorselle tekrar deneniyor:", coordinateError.message);
+      try {
+        normalizedLayout = normalizeLayout(await requestLayout(true));
+        source = "visual";
+      } catch (visualError) {
+        console.warn("Gemini gorsel cumle duzeni de kullanilamadi; geometrik siralama kullaniliyor:", visualError.message);
+        return fallback();
+      }
     }
+    const { byId, lines, sentences } = normalizedLayout;
 
     const lineById = new Map();
     lines.forEach((line, index) => line.word_ids.forEach((id) => lineById.set(id, `layout_${index}`)));
@@ -553,9 +598,9 @@ async function organizeSentenceGroupsWithGemini(image, words) {
         text: sentenceWords.map((word) => word.text).join(" ")
       };
     }).filter((group) => group.words.length);
-    return { words: organizedWords, groups };
+    return { words: organizedWords, groups, source };
   } catch (error) {
-    console.warn("Gemini cumle duzeni iki denemede de kullanilamadi; geometrik siralama kullaniliyor:", error.message);
+    console.warn("Gemini cumle duzeni kullanilamadi; geometrik siralama kullaniliyor:", error.message);
     return fallback();
   }
 }
@@ -588,7 +633,6 @@ async function correctSentenceGroupWithGemini(image, group) {
       "Content-Type": "application/json",
       "x-goog-api-key": process.env.GEMINI_API_KEY
     },
-    signal: AbortSignal.timeout(45000),
     body: JSON.stringify({
       systemInstruction: { parts: [{ text: correctionInstructions() }] },
       contents: [{
@@ -1356,26 +1400,28 @@ function detectDeterministicGrammar(words, sentenceGroups = []) {
       break;
     }
 
-    // A duration/age such as "three years old" is not a plural object.
-    // Without this guard a later "If it rains" could become "If them rains"
-    // when punctuation or AI sentence grouping was unavailable.
-    if (Number(amount) !== 1 && !isAgeExpression) {
-      const objectEnd = Math.min(numberIndex + 9, readingOrder.length);
-      for (let pronounIndex = numberIndex + 2; pronounIndex < objectEnd; pronounIndex += 1) {
-        if (!sharesLogicalGroup(readingOrder[numberIndex], readingOrder[pronounIndex])) break;
-        if (normalizedReading[pronounIndex] !== "it") continue;
-        corrections.push({
-          action: "replace",
-          original: readingOrder[pronounIndex].text,
-          replacement: "them",
-          reason: "Use a plural object pronoun for multiple items.",
-          target_id: readingOrder[pronounIndex].id,
-          left_id: "",
-          right_id: ""
-        });
-        break;
-      }
+    const hasCoordinatedObject = normalizedReading
+      .slice(numberIndex + 1, Math.min(numberIndex + 9, normalizedReading.length))
+      .some((token, index, sequence) => (token === "and" || token === "or")
+        && Boolean(sequence[index + 1]));
+    if (isAgeExpression || !hasCoordinatedObject) continue;
+
+    const objectEnd = Math.min(numberIndex + 9, readingOrder.length);
+    for (let pronounIndex = numberIndex + 2; pronounIndex < objectEnd; pronounIndex += 1) {
+      if (!sharesLogicalGroup(readingOrder[numberIndex], readingOrder[pronounIndex])) break;
+      if (normalizedReading[pronounIndex] !== "it") continue;
+      corrections.push({
+        action: "replace",
+        original: readingOrder[pronounIndex].text,
+        replacement: "them",
+        reason: "Use a plural object pronoun for multiple items.",
+        target_id: readingOrder[pronounIndex].id,
+        left_id: "",
+        right_id: ""
+      });
+      break;
     }
+
   }
   return corrections;
 }
@@ -1766,6 +1812,7 @@ module.exports = {
   attachOcrAnchors,
   buildOcrLines,
   buildSentenceGroups,
+  correctSentenceGroupWithGemini,
   detectAdvancedGrammar,
   detectDeterministicGrammar,
   diffLineToCorrections,
