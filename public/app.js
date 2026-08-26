@@ -7,11 +7,11 @@ const editor = document.querySelector("#editor");
 const status = document.querySelector("#status");
 const fileName = document.querySelector("#fileName");
 
-const engines = ["apple", "google"].map((name) => {
+const providers = ["openai", "gemini"].map((name) => {
   const canvas = document.querySelector(`#${name}Canvas`);
   return {
     name,
-    label: name === "apple" ? "Apple Vision" : "Google Cloud Vision",
+    label: name === "openai" ? "OpenAI GPT" : "Google Gemini",
     canvas,
     ctx: canvas.getContext("2d"),
     status: document.querySelector(`#${name}Status`),
@@ -29,7 +29,7 @@ chooseButton.addEventListener("click", () => fileInput.click());
 changeButton.addEventListener("click", () => fileInput.click());
 fileInput.addEventListener("change", () => loadFile(fileInput.files[0]));
 correctButton.addEventListener("click", correctLetter);
-for (const engine of engines) engine.downloadButton.addEventListener("click", () => downloadResult(engine));
+for (const provider of providers) provider.downloadButton.addEventListener("click", () => downloadResult(provider));
 dropzone.addEventListener("keydown", (event) => {
   if (event.key === "Enter" || event.key === " ") fileInput.click();
 });
@@ -55,71 +55,71 @@ async function loadFile(file) {
 
   sourceDataUrl = await readFile(file);
   sourceImage = await loadImage(sourceDataUrl);
-  for (const engine of engines) {
-    engine.processedImage = null;
-    engine.canvas.width = sourceImage.naturalWidth;
-    engine.canvas.height = sourceImage.naturalHeight;
-    drawOriginal(engine);
-    engine.status.textContent = "Düzeltmeye hazır.";
-    engine.status.classList.remove("error");
-    engine.downloadButton.hidden = true;
-    engine.correctionList.hidden = true;
+  for (const provider of providers) {
+    provider.processedImage = null;
+    provider.canvas.width = sourceImage.naturalWidth;
+    provider.canvas.height = sourceImage.naturalHeight;
+    drawOriginal(provider);
+    provider.status.textContent = "Düzeltmeye hazır.";
+    provider.status.classList.remove("error");
+    provider.downloadButton.hidden = true;
+    provider.correctionList.hidden = true;
   }
 
   fileName.textContent = file.name;
   dropzone.hidden = true;
   editor.hidden = false;
   correctButton.hidden = false;
-  showStatus("Aynı fotoğraf Apple ve Google OCR ile karşılaştırılacak.");
+  showStatus("Aynı Google OCR metni GPT ve Gemini ile karşılaştırılacak.");
 }
 
 async function correctLetter() {
   if (!sourceDataUrl) return;
   correctButton.disabled = true;
-  showStatus("İki OCR motoru paralel olarak çalışıyor…");
-  for (const engine of engines) {
-    engine.processedImage = null;
-    drawOriginal(engine);
-    engine.status.textContent = `${engine.label} el yazısını okuyor…`;
-    engine.status.classList.remove("error");
-    engine.downloadButton.hidden = true;
-    engine.correctionList.hidden = true;
+  showStatus("Google OCR okunuyor; GPT ve Gemini paralel çalışıyor…");
+  for (const provider of providers) {
+    provider.processedImage = null;
+    drawOriginal(provider);
+    provider.status.textContent = `${provider.label} metni kontrol ediyor…`;
+    provider.status.classList.remove("error");
+    provider.downloadButton.hidden = true;
+    provider.correctionList.hidden = true;
   }
 
-  const outcomes = await Promise.all(engines.map(runEngine));
+  const outcomes = await Promise.all(providers.map(runProvider));
   const successful = outcomes.filter(Boolean).length;
   showStatus(successful === 2
     ? "İki sonuç hazır; yan yana karşılaştırabilirsin."
     : successful === 1
-      ? "Bir OCR sonucu hazır; diğer paneldeki kurulum/hata mesajını kontrol et."
-      : "İki OCR motoru da sonuç üretemedi.", successful === 0);
+      ? "Bir yapay zekâ sonucu hazır; diğer paneldeki API ayarını kontrol et."
+      : "İki yapay zekâ sağlayıcısı da sonuç üretemedi.", successful === 0);
   correctButton.disabled = false;
 }
 
-async function runEngine(engine) {
+async function runProvider(provider) {
   try {
     const response = await fetch("/api/correct", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ image: sourceDataUrl, ocr_engine: engine.name })
+      body: JSON.stringify({ image: sourceDataUrl, ai_provider: provider.name })
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || "Düzeltme yapılamadı.");
 
-    engine.coordinateSpace = result.coordinate_space || engine.coordinateSpace;
-    if (result.cleaned_image) engine.processedImage = await loadImage(result.cleaned_image);
-    drawOriginal(engine);
-    drawCorrections(engine, result.corrections);
-    renderCorrectionList(engine, result.corrections);
+    provider.coordinateSpace = result.coordinate_space || provider.coordinateSpace;
+    if (result.cleaned_image) provider.processedImage = await loadImage(result.cleaned_image);
+    drawOriginal(provider);
+    drawCorrections(provider, result.corrections);
+    renderCorrectionList(provider, result.corrections);
     const count = result.corrections.length;
-    engine.status.textContent = count
+    provider.status.textContent = count
       ? `${count} düzeltme fotoğrafın üzerine işlendi.`
       : "Mektupta belirgin bir hata bulunamadı.";
-    engine.downloadButton.hidden = false;
+    provider.downloadButton.hidden = false;
     return true;
   } catch (error) {
-    engine.status.textContent = error.message;
-    engine.status.classList.add("error");
+    provider.status.textContent = error.message;
+    provider.status.classList.add("error");
     return false;
   }
 }

@@ -12,23 +12,11 @@
 </head>
 <body>
   <main class="shell">
-    <header class="hero">
-      <div class="brand"><span class="brand-mark">M</span> Mektup Düzeltici</div>
-      <div class="hero-copy">
-        <p class="eyebrow">İngilizce el yazısı kontrolü</p>
-        <h1>Mektubunu yükle,<br><em>düzeltilmiş hâlini</em> indir.</h1>
-        <p class="intro">Yanlış kelimeler çizilir, doğruları kendi fotoğrafının üzerine doğal bir el yazısı görünümüyle eklenir.</p>
-      </div>
-    </header>
-
     <section class="workspace">
       <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="Fotoğraf yükle">
         <input id="fileInput" type="file" accept="image/jpeg,image/png,image/webp" hidden>
-        <div class="upload-icon" aria-hidden="true">↟</div>
-        <h2>Mektup fotoğrafını buraya bırak</h2>
-        <p>veya bilgisayarından seç</p>
+        <h2>Mektup fotoğrafını yükle</h2>
         <button id="chooseButton" class="button primary" type="button">Fotoğraf seç</button>
-        <small>JPG, PNG veya WebP · En fazla 12 MB</small>
       </div>
 
       <div id="editor" class="editor" hidden>
@@ -41,28 +29,27 @@
         </div>
         <div class="comparison-grid">
           <article class="result-panel">
-            <div class="result-heading"><div><span class="engine-dot apple"></span><strong>Apple Vision</strong></div><small>Yerel OCR</small></div>
-            <div class="canvas-wrap"><canvas id="appleCanvas"></canvas></div>
-            <div id="appleStatus" class="engine-status" aria-live="polite"></div>
-            <button id="appleDownloadButton" class="button secondary panel-download" type="button" hidden>Apple sonucunu indir <span>↓</span></button>
-            <div id="appleCorrectionList" class="correction-list compact" hidden></div>
+            <div class="result-heading"><div><span class="engine-dot openai"></span><strong>OpenAI GPT</strong></div><small>Google OCR</small></div>
+            <div class="canvas-wrap"><canvas id="openaiCanvas"></canvas></div>
+            <div id="openaiStatus" class="engine-status" aria-live="polite"></div>
+            <button id="openaiDownloadButton" class="button secondary panel-download" type="button" hidden>GPT sonucunu indir <span>↓</span></button>
+            <div id="openaiCorrectionList" class="correction-list compact output-details" hidden></div>
           </article>
           <article class="result-panel">
-            <div class="result-heading"><div><span class="engine-dot google"></span><strong>Google Cloud Vision</strong></div><small>Bulut OCR</small></div>
-            <div class="canvas-wrap"><canvas id="googleCanvas"></canvas></div>
-            <div id="googleStatus" class="engine-status" aria-live="polite"></div>
-            <button id="googleDownloadButton" class="button secondary panel-download" type="button" hidden>Google sonucunu indir <span>↓</span></button>
-            <div id="googleCorrectionList" class="correction-list compact" hidden></div>
+            <div class="result-heading"><div><span class="engine-dot gemini"></span><strong>Google Gemini</strong></div><small>Google OCR</small></div>
+            <div class="canvas-wrap"><canvas id="geminiCanvas"></canvas></div>
+            <div id="geminiStatus" class="engine-status" aria-live="polite"></div>
+            <button id="geminiDownloadButton" class="button secondary panel-download" type="button" hidden>Gemini sonucunu indir <span>↓</span></button>
+            <div id="geminiCorrectionList" class="correction-list compact output-details" hidden></div>
           </article>
         </div>
         <div id="status" class="status" aria-live="polite"></div>
         <div class="actions">
-          <button id="correctButton" class="button primary wide" type="button">İki OCR ile düzelt <span>→</span></button>
+          <button id="correctButton" class="button primary wide" type="button">GPT ve Gemini ile düzelt <span>→</span></button>
         </div>
       </div>
     </section>
 
-    <footer><span>01 · Yükle</span><i></i><span>02 · Kontrol et</span><i></i><span>03 · İndir</span></footer>
   </main>
   <script src="/app.js" defer></script>
 </body>
