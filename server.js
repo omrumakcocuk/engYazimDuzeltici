@@ -23,6 +23,7 @@ const INPAINT_SCRIPT = path.join(__dirname, "inpaint.py");
 const PAPER_CROP_SCRIPT = path.join(__dirname, "paper_crop.py");
 const PYTHON_BIN = path.join(__dirname, ".venv", "bin", "python3");
 const ENGLISH_VARIANT = process.env.ENGLISH_VARIANT || "en-US";
+const GEMINI_TIMEOUT_MS = Math.max(15_000, Number(process.env.GEMINI_TIMEOUT_MS || 75_000));
 let languageToolProcess = null;
 let googleVisionClient = null;
 const googleOcrCache = new Map();
@@ -31,9 +32,23 @@ const groupCorrectionSchema = {
   type: "object",
   additionalProperties: false,
   properties: {
-    corrected: { type: "string" }
+    corrected: { type: "string" },
+    edits: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          target_ids: { type: "array", items: { type: "string" } },
+          left_id: { type: "string" },
+          right_id: { type: "string" },
+          replacement: { type: "string" }
+        },
+        required: ["target_ids", "left_id", "right_id", "replacement"]
+      }
+    }
   },
-  required: ["corrected"]
+  required: ["corrected", "edits"]
 };
 
 const sentenceLayoutSchema = {
@@ -97,7 +112,8 @@ async function correctLetter(req, res) {
     return json(res, 500, { error: ".env dosyasinda GEMINI_API_KEY eksik." });
   }
 
-  const workingImage = await cropPaperImage(body.image);
+  const paper = await cropPaperImage(body.image);
+  const workingImage = paper.image;
   let words;
   try {
     const recognizedWords = await recognizeGoogleWordsCached(workingImage);
@@ -112,20 +128,30 @@ async function correctLetter(req, res) {
     const organized = await organizeSentenceGroupsWithGemini(workingImage, words);
     words = organized.words;
     const sentenceGroups = organized.groups;
-    const correctionGroups = await mapWithConcurrency(sentenceGroups, 3, async (group) => {
-      let correctedText;
+    const fallbackGroups = [];
+    const correctionGroups = await mapWithConcurrency(sentenceGroups, 2, async (group) => {
+      let modelResult;
       try {
-        correctedText = await correctSentenceGroup(workingImage, group, aiProvider);
+        modelResult = await correctSentenceGroup(workingImage, group, aiProvider);
       } catch (error) {
-        throw stageError(`Gemini cümle düzeltmesi (${group.id})`, error);
+        console.warn(`Gemini cümle düzeltmesi kullanılamadı (${group.id}); güvenli yedek kullanılıyor:`, error.message);
+        fallbackGroups.push({ id: group.id, error: error.message });
+        modelResult = { corrected: group.text, edits: [], source: "fallback" };
       }
 
       let validated;
       try {
-        validated = await validateWithLanguageTool(correctedText);
+        validated = await validateWithLanguageTool(modelResult.corrected);
       } catch (error) {
-        throw stageError(`LanguageTool doğrulaması (${group.id})`, error);
+        console.warn(`LanguageTool doğrulaması kullanılamadı (${group.id}):`, error.message);
+        validated = modelResult.corrected;
       }
+      // Gemini'nin OCR-ID tabanlı minimal editlerini LanguageTool'un bütün
+      // cümleyi yeniden yazmasıyla ezmeyelim. LanguageTool, Gemini hiç edit
+      // üretemediyse veya yedek akış çalıştıysa güvenli son kontrol olur.
+      const geminiCorrections = correctionsFromGeminiEdits(group, modelResult.edits, modelResult.corrected)
+        || diffLineToCorrections(group, modelResult.corrected);
+      if (geminiCorrections.length) return geminiCorrections;
       return diffLineToCorrections(group, validated);
     });
     const corrections = correctionGroups.flat();
@@ -142,7 +168,8 @@ async function correctLetter(req, res) {
       )
     );
 
-    const anchoredCorrections = attachOcrAnchors(finalCorrections, words);
+    const renderableCorrections = filterUnrenderableCorrections(finalCorrections, words);
+    const anchoredCorrections = attachOcrAnchors(renderableCorrections, words);
     let cleanedImage;
     try {
       cleanedImage = await inpaintImage(workingImage, anchoredCorrections);
@@ -156,8 +183,10 @@ async function correctLetter(req, res) {
       cleaned_image: cleanedImage,
       ocr_engine: "google",
       ai_provider: aiProvider,
+      analysis_source: fallbackGroups.length ? "gemini_with_fallback" : "gemini",
+      fallback_groups: fallbackGroups,
       sentence_layout: organized.source,
-      paper_cropped: workingImage !== body.image,
+      paper_cropped: paper.cropped,
       coordinate_space: { width: 1000, height: 1000 }
     });
   } catch (error) {
@@ -175,7 +204,9 @@ function stageError(stage, error) {
 
 async function cropPaperImage(dataUrl) {
   const match = dataUrl.match(/^data:image\/(jpeg|png|webp);base64,(.+)$/s);
-  if (!match || !fs.existsSync(PYTHON_BIN) || !fs.existsSync(PAPER_CROP_SCRIPT)) return dataUrl;
+  if (!match || !fs.existsSync(PYTHON_BIN) || !fs.existsSync(PAPER_CROP_SCRIPT)) {
+    return { image: dataUrl, cropped: false };
+  }
 
   const extension = match[1] === "jpeg" ? "jpg" : match[1];
   const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "mektup-paper-"));
@@ -183,15 +214,20 @@ async function cropPaperImage(dataUrl) {
   const outputPath = path.join(tempDir, "paper.jpg");
   try {
     await fs.promises.writeFile(inputPath, Buffer.from(match[2], "base64"));
-    await execFileAsync(PYTHON_BIN, [PAPER_CROP_SCRIPT, inputPath, outputPath], {
+    const { stdout } = await execFileAsync(PYTHON_BIN, [PAPER_CROP_SCRIPT, inputPath, outputPath], {
       timeout: 30000,
       maxBuffer: 2 * 1024 * 1024
     });
     const output = await fs.promises.readFile(outputPath);
-    return `data:image/jpeg;base64,${output.toString("base64")}`;
+    let metadata = {};
+    try { metadata = JSON.parse(stdout || "{}"); } catch {}
+    return {
+      image: `data:image/jpeg;base64,${output.toString("base64")}`,
+      cropped: metadata.cropped === true
+    };
   } catch (error) {
     console.warn("Kagit kenarlari bulunamadi; orijinal fotograf kullaniliyor:", error.message);
-    return dataUrl;
+    return { image: dataUrl, cropped: false };
   } finally {
     await fs.promises.rm(tempDir, { recursive: true, force: true });
   }
@@ -478,7 +514,19 @@ function lineClearlyContinues(line, nextLine) {
     "to", "of", "for", "from", "with", "at", "in", "on", "into",
     "and", "or", "but", "because", "if", "when", "while", "than"
   ]);
-  return requiresContinuation.has(last);
+  if (requiresContinuation.has(last)) return true;
+
+  // Noktalamasız çocuk yazılarında satır sonu çoğunlukla cümle sonu değildir.
+  // Sonraki satır küçük harfle başlıyorsa veya mevcut satır sağ kenara kadar
+  // dolmuşsa normal bir satır kayması kabul edilir. Büyük harfle başlayan yeni
+  // özne ise ancak önceki satır bariz biçimde eksikse birleştirilir.
+  const nextRaw = nextLine.words[0]?.text?.trim() || "";
+  const nextStartsLower = /^[a-z]/.test(nextRaw);
+  const lineLeft = Math.min(...line.words.map((word) => word.x));
+  const lineRight = Math.max(...line.words.map((word) => word.x + word.width));
+  const nextLeft = Math.min(...nextLine.words.map((word) => word.x));
+  const likelyWrapped = line.words.length >= 4 && nextLeft <= lineLeft + 140 && lineRight >= 690;
+  return nextStartsLower || likelyWrapped;
 }
 
 async function correctSentenceGroup(image, group) {
@@ -517,17 +565,18 @@ async function organizeSentenceGroupsWithGemini(image, words) {
         generationConfig: {
           temperature: 0,
           maxOutputTokens: 4096,
-          thinkingConfig: { thinkingLevel: "low" },
+          thinkingConfig: { thinkingLevel: "minimal" },
           responseMimeType: "application/json",
           responseJsonSchema: sentenceLayoutSchema
         }
-      })
+      }),
+      signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS)
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error?.message || `Gemini HTTP ${response.status}`);
     const raw = (data.candidates?.[0]?.content?.parts || []).map((part) => part.text || "").join("");
     if (!raw) throw new Error("Gemini bos cumle duzeni dondurdu.");
-    return JSON.parse(raw);
+    return parseGeminiJson(raw);
   };
   const normalizeLayout = (layout) => {
     const byId = new Map(words.map((word) => [word.id, word]));
@@ -536,18 +585,17 @@ async function organizeSentenceGroupsWithGemini(image, words) {
       if (!Array.isArray(items) || !items.length) throw new Error(`Gemini ${name} listesi bos.`);
       const seen = new Set();
       const normalized = items.map((item) => {
-        if (!item || !Array.isArray(item.word_ids) || !item.word_ids.length) {
-          throw new Error(`Gemini ${name} grubunda kelime ID'si eksik.`);
-        }
-        const wordIds = item.word_ids.map((id) => {
-          if (!validIds.has(id) || seen.has(id)) {
-            throw new Error(`Gemini ${name} listesinde gecersiz veya tekrarli kelime ID'si var.`);
-          }
+        const supplied = item && Array.isArray(item.word_ids) ? item.word_ids : [];
+        // Modelin tek bir hayali ID veya tekrarı bütün düzeni bozmasın. Bunları
+        // at; fakat gerçek OCR kelimelerinden biri eksikse görsel denemeye geç.
+        const wordIds = supplied.filter((id) => {
+          if (!validIds.has(id) || seen.has(id)) return false;
           seen.add(id);
-          return id;
+          return true;
         });
         return { word_ids: wordIds };
-      });
+      }).filter((item) => item.word_ids.length);
+      if (!normalized.length) throw new Error(`Gemini ${name} listesi bos.`);
       if (seen.size !== validIds.size) {
         throw new Error(`Gemini ${name} listesi OCR kelimelerinin tamamini kapsamiyor.`);
       }
@@ -610,7 +658,10 @@ function correctionInstructions() {
     "Correct exactly one logical handwritten English sentence group.",
     "The group may span multiple physical lines. Treat only the supplied OCR token sequence as this task's sentence and do not use other sentences in the photograph as linguistic context.",
     "OCR tokens are approximate aids; use the photograph to resolve handwriting, but ignore printed keyboard/background text and crossed-out or scribbled text.",
-    "Return the complete corrected sentence group, not individual edits.",
+    "Return the complete corrected sentence group and the minimal OCR-ID edits that produce it.",
+    "For a replacement, target_ids must contain only the consecutive OCR word IDs being replaced; leave left_id and right_id empty.",
+    "For a missing-word insertion, target_ids must be empty and left_id/right_id must be the immediately adjacent OCR IDs.",
+    "Do not include unchanged words in an edit. Use an empty edits array when the sentence is already correct.",
     "Correct spelling, missing words, verb forms, agreement, articles, prepositions, and word order.",
     "Check B1-B2 structures explicitly: conditionals, comparative forms, relative clauses, reported speech, tense consistency, gerunds and infinitives, and redundant conjunctions such as Although ... but.",
     "Respect the logical sentence boundaries supplied in the OCR token sequence even when the photograph has no punctuation.",
@@ -624,44 +675,140 @@ function correctionInstructions() {
 
 async function correctSentenceGroupWithGemini(image, group) {
   const tokenText = group.words.map((word) => `[${word.id}]${word.text}`).join(" ");
-  const match = image.match(/^data:image\/(jpeg|png|webp);base64,(.+)$/s);
-  if (!match) throw new Error("Gemini icin gecersiz fotograf verisi.");
   const model = process.env.GEMINI_MODEL || "gemini-3.6-flash";
-  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-goog-api-key": process.env.GEMINI_API_KEY
-    },
-    body: JSON.stringify({
-      systemInstruction: { parts: [{ text: correctionInstructions() }] },
-      contents: [{
-        role: "user",
-        parts: [
-          { text: `Correct only ${group.id} from physical lines ${group.lineIds.join(", ")}:\n${tokenText}` },
-          { inlineData: { mimeType: `image/${match[1]}`, data: match[2] } }
-        ]
-      }],
-      generationConfig: {
-        temperature: 0,
-        maxOutputTokens: 2048,
-        thinkingConfig: { thinkingLevel: "low" },
-        responseMimeType: "application/json",
-        responseJsonSchema: groupCorrectionSchema
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const startedAt = Date.now();
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": process.env.GEMINI_API_KEY
+        },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: correctionInstructions() }] },
+          contents: [{
+            role: "user",
+            // El yazısı bir kez Google OCR tarafından okunup ID'lendi. Her
+            // grupta bütün fotoğrafı yeniden göndermek modeli başka satırlara
+            // kaydırıyor ve büyük mektuplarda gereksiz timeout oluşturuyordu.
+            parts: [{ text: `Correct only ${group.id} from physical lines ${group.lineIds.join(", ")}:\n${tokenText}` }]
+          }],
+          generationConfig: {
+            temperature: 0,
+            maxOutputTokens: 2048,
+            thinkingConfig: { thinkingLevel: "minimal" },
+            responseMimeType: "application/json",
+            responseJsonSchema: groupCorrectionSchema
+          }
+        }),
+        signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS)
+      });
+      const data = await response.json();
+      console.info(`Gemini ${group.id} deneme ${attempt}: HTTP ${response.status}, ${Date.now() - startedAt}ms`);
+      if (!response.ok) throw new Error(data.error?.message || `Gemini HTTP ${response.status}`);
+      const output = (data.candidates?.[0]?.content?.parts || [])
+        .map((part) => part.text || "")
+        .join("")
+        .trim();
+      if (!output) {
+        const reason = data.promptFeedback?.blockReason || data.candidates?.[0]?.finishReason;
+        throw new Error(reason ? `Gemini sonuc dondurmedi: ${reason}` : "Gemini cumle grubu sonucu dondurmedi.");
       }
-    })
-  });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error?.message || "Gemini istegi basarisiz oldu.");
-  const output = (data.candidates?.[0]?.content?.parts || [])
-    .map((part) => part.text || "")
-    .join("")
-    .trim();
-  if (!output) {
-    const reason = data.promptFeedback?.blockReason || data.candidates?.[0]?.finishReason;
-    throw new Error(reason ? `Gemini sonuc dondurmedi: ${reason}` : "Gemini cumle grubu sonucu dondurmedi.");
+      const parsed = parseGeminiJson(output);
+      if (typeof parsed.corrected !== "string") throw new Error("Gemini JSON yanitinda corrected alani eksik.");
+      const edits = normalizeGeminiEdits(group, parsed.edits);
+      return {
+        corrected: parsed.corrected,
+        edits,
+        source: "gemini"
+      };
+    } catch (error) {
+      lastError = error;
+      const retryable = isRetryableGeminiError(error);
+      if (retryable && attempt < 3) {
+        const delay = attempt * 1500;
+        console.warn(`Gemini ${group.id} denemesi başarısız (${error.message}); ${delay}ms sonra tekrar denenecek.`);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      } else if (!retryable || attempt === 3) {
+        console.warn(`Gemini ${group.id} için tekrar deneme yapılamıyor:`, error.message);
+      }
+    }
   }
-  return JSON.parse(output).corrected;
+  throw lastError;
+}
+
+function isRetryableGeminiError(error) {
+  const message = String(error?.message || error).toLowerCase();
+  return /internal error|temporar|timeout|timed out|aborted|429|500|502|503|504|fetch failed|json|corrected|kelime id|edit/.test(message);
+}
+
+function normalizeGeminiEdits(group, edits) {
+  if (!Array.isArray(edits)) throw new Error("Gemini JSON yanitinda edits dizisi eksik.");
+  const ids = group.words.map((word) => word.id);
+  const indexById = new Map(ids.map((id, index) => [id, index]));
+  const normalized = [];
+  for (const edit of edits) {
+    if (!edit || typeof edit.replacement !== "string" || !edit.replacement.trim()) {
+      // The corrected sentence is the authoritative model result. Gemini can
+      // occasionally omit one optional-looking field despite the JSON schema.
+      // Retrying the whole request for that metadata wastes several seconds;
+      // discard all model anchors and rebuild them deterministically from the
+      // corrected sentence instead.
+      console.warn(`Gemini ${group.id} edit metadata eksik; OCR farki kullanilacak.`);
+      return [];
+    }
+    const targets = Array.isArray(edit.target_ids) ? edit.target_ids : [];
+    if (targets.length) {
+      const indexes = targets.map((id) => indexById.get(id));
+      if (indexes.some((index) => index === undefined)
+          || indexes.some((index, position) => position && index !== indexes[position - 1] + 1)) {
+        console.warn(`Gemini ${group.id} edit ID'leri gecersiz; OCR farki kullanilacak.`);
+        return [];
+      }
+      normalized.push({
+        target_ids: targets,
+        left_id: "",
+        right_id: "",
+        replacement: edit.replacement.trim()
+      });
+      continue;
+    }
+    const left = indexById.get(edit.left_id);
+    const right = indexById.get(edit.right_id);
+    if (left === undefined && right === undefined) {
+      console.warn(`Gemini ${group.id} ekleme komsulari eksik; OCR farki kullanilacak.`);
+      return [];
+    }
+    if (left !== undefined && right !== undefined && right !== left + 1) {
+      console.warn(`Gemini ${group.id} ekleme komsulari bitisik degil; OCR farki kullanilacak.`);
+      return [];
+    }
+    normalized.push({
+      target_ids: [],
+      left_id: edit.left_id || "",
+      right_id: edit.right_id || "",
+      replacement: edit.replacement.trim()
+    });
+  }
+  return normalized;
+}
+
+function parseGeminiJson(raw) {
+  const trimmed = String(raw || "").trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "");
+  try {
+    return JSON.parse(trimmed);
+  } catch (firstError) {
+    const firstBrace = trimmed.indexOf("{");
+    const lastBrace = trimmed.lastIndexOf("}");
+    if (firstBrace < 0 || lastBrace <= firstBrace) throw firstError;
+    const candidate = trimmed.slice(firstBrace, lastBrace + 1)
+      .replace(/,\s*([}\]])/g, "$1");
+    return JSON.parse(candidate);
+  }
 }
 
 async function validateWithLanguageTool(sentence) {
@@ -697,10 +844,9 @@ async function validateWithLanguageTool(sentence) {
 function filterLikelyOcrArtifacts(corrections) {
   return corrections.filter((item) => {
     if (item.action === "insert") {
-      return /^(a|an)$/i.test(item.replacement)
-        && Boolean(item.left_id)
-        && Boolean(item.right_id);
+      return isSafeCorrection(item);
     }
+    if (item.action === "rewrite_line") return isSafeCorrection(item);
     if (item.action !== "replace") return false;
     const original = item.original.toLowerCase().replace(/[^a-z0-9']/g, "");
     const replacement = item.replacement.toLowerCase().replace(/[^a-z']/g, "");
@@ -756,7 +902,13 @@ function filterProtectedProperNames(corrections, groups) {
       }
     });
   }
-  return corrections.filter((item) => item.action !== "replace" || !protectedIds.has(item.target_id));
+  return corrections.filter((item) => {
+    if (item.action === "replace") return !protectedIds.has(item.target_id);
+    if (item.action === "rewrite_line") {
+      return !(item.target_ids || []).some((id) => protectedIds.has(id));
+    }
+    return true;
+  });
 }
 
 function enforceParallelCorrectionForms(corrections, groups) {
@@ -861,34 +1013,210 @@ function diffLineToCorrections(line, correctedText) {
     }
   }
 
-  const operations = [];
+  // Keep the complete alignment. A grammar engine often changes a phrase as
+  // one unit ("to read" -> "reading", "me to" -> "that I"). Converting
+  // those changes into unrelated word edits caused half-corrections to be
+  // rejected and left old words visible under the new phrase.
+  const alignment = [];
   let i = original.length;
   let j = corrected.length;
   while (i > 0 || j > 0) {
     const same = i > 0 && j > 0 && original[i - 1].toLowerCase() === corrected[j - 1].toLowerCase();
-    if (same) { i -= 1; j -= 1; continue; }
+    if (same) {
+      alignment.push({ type: "match", originalIndex: i - 1, correctedIndex: j - 1, position: i - 1 });
+      i -= 1; j -= 1; continue;
+    }
     if (i > 0 && j > 0 && dp[i][j] === dp[i - 1][j - 1] + 1) {
-      operations.push(makeReplace(line.words[i - 1], corrected[j - 1]));
+      alignment.push({ type: "replace", originalIndex: i - 1, correctedIndex: j - 1, position: i - 1 });
       i -= 1; j -= 1; continue;
     }
     if (j > 0 && dp[i][j] === dp[i][j - 1] + 1) {
-      operations.push(makeInsert(line.words[i - 1], line.words[i], corrected[j - 1]));
+      alignment.push({ type: "insert", originalIndex: null, correctedIndex: j - 1, position: i });
       j -= 1; continue;
     }
-    operations.push(makeReplace(line.words[i - 1], ""));
+    alignment.push({ type: "delete", originalIndex: i - 1, correctedIndex: null, position: i - 1 });
     i -= 1;
   }
-  return operations.reverse().filter(isSafeCorrection);
+  alignment.reverse();
+
+  const operations = [];
+  for (let cursor = 0; cursor < alignment.length;) {
+    if (alignment[cursor].type === "match") { cursor += 1; continue; }
+    const block = [];
+    while (cursor < alignment.length && alignment[cursor].type !== "match") {
+      block.push(alignment[cursor]);
+      cursor += 1;
+    }
+    const originalIndices = [...new Set(block
+      .map((item) => item.originalIndex)
+      .filter(Number.isInteger))];
+    const correctedIndices = [...new Set(block
+      .map((item) => item.correctedIndex)
+      .filter(Number.isInteger))];
+    const targetWords = originalIndices.map((index) => line.words[index]).filter(Boolean);
+    const replacementTokens = correctedIndices.map((index) => corrected[index]).filter(Boolean);
+    const replacement = replacementTokens.join(" ");
+
+    if (!targetWords.length) {
+      const position = block[0]?.position ?? 0;
+      const insertion = makeInsert(line.words[position - 1], line.words[position], replacement);
+      if (isSafeCorrection(insertion)) operations.push(insertion);
+      continue;
+    }
+
+    if (targetWords.length === 1 && replacementTokens.length === 1) {
+      const single = makeReplace(targetWords[0], replacement);
+      if (isSafeCorrection(single)) {
+        operations.push(single);
+        continue;
+      }
+    }
+
+    if (isSafeModelRewrite(targetWords, replacementTokens)) {
+      operations.push({
+        action: "rewrite_line",
+        original: targetWords.map((word) => word.text).join(" "),
+        replacement,
+        reason: `Replace the grammatical phrase with “${replacement}”.`,
+        target_ids: targetWords.map((word) => word.id),
+        target_id: "", left_id: "", right_id: ""
+      });
+    }
+  }
+  return operations;
+}
+
+function correctionsFromGeminiEdits(group, edits, validatedText) {
+  if (!Array.isArray(edits)) return null;
+  const byId = new Map(group.words.map((word, index) => [word.id, { word, index }]));
+  const claimed = new Set();
+  const corrections = [];
+
+  for (const edit of edits) {
+    if (!edit || typeof edit.replacement !== "string" || !Array.isArray(edit.target_ids)) return null;
+    const replacementTokens = tokenize(edit.replacement);
+    if (!replacementTokens.length || replacementTokens.length > 6) return null;
+
+    if (edit.target_ids.length) {
+      if (edit.target_ids.length > 6 || edit.left_id || edit.right_id) return null;
+      const entries = edit.target_ids.map((id) => byId.get(id));
+      if (entries.some((entry) => !entry)) return null;
+      const indices = entries.map((entry) => entry.index);
+      if (indices.some((index, offset) => offset && index !== indices[offset - 1] + 1)) return null;
+      if (edit.target_ids.some((id) => claimed.has(id))) return null;
+      edit.target_ids.forEach((id) => claimed.add(id));
+      const targetWords = entries.map((entry) => entry.word);
+      const replacement = replacementTokens.join(" ");
+      const single = targetWords.length === 1 && replacementTokens.length === 1
+        ? makeReplace(targetWords[0], replacement)
+        : null;
+      corrections.push(single && isSafeCorrection(single) ? single : {
+        action: "rewrite_line",
+        original: targetWords.map((word) => word.text).join(" "),
+        replacement,
+        reason: `Replace the grammatical phrase with “${replacement}”.`,
+        target_ids: targetWords.map((word) => word.id),
+        target_id: "", left_id: "", right_id: ""
+      });
+      continue;
+    }
+
+    const left = byId.get(edit.left_id);
+    const right = byId.get(edit.right_id);
+    if (!left || !right || right.index !== left.index + 1) return null;
+    const insertion = makeInsert(left.word, right.word, replacementTokens.join(" "));
+    if (!isSafeCorrection(insertion)) return null;
+    corrections.push(insertion);
+  }
+
+  const rebuilt = applyCorrectionsToGroup(group, corrections);
+  const expected = tokenize(validatedText).map((token) => token.toLowerCase()).join("\u0000");
+  const actual = tokenize(rebuilt).map((token) => token.toLowerCase()).join("\u0000");
+  return actual === expected ? corrections : null;
+}
+
+function applyCorrectionsToGroup(group, corrections) {
+  const indexById = new Map(group.words.map((word, index) => [word.id, index]));
+  const rewriteAt = new Map();
+  const insertAt = new Map();
+  for (const correction of corrections) {
+    if (correction.action === "insert") {
+      insertAt.set(indexById.get(correction.right_id), correction.replacement);
+      continue;
+    }
+    const ids = correction.action === "rewrite_line" ? correction.target_ids : [correction.target_id];
+    const start = indexById.get(ids[0]);
+    rewriteAt.set(start, { count: ids.length, replacement: correction.replacement });
+  }
+  const output = [];
+  for (let index = 0; index < group.words.length;) {
+    if (insertAt.has(index)) output.push(insertAt.get(index));
+    const rewrite = rewriteAt.get(index);
+    if (rewrite) {
+      output.push(rewrite.replacement);
+      index += rewrite.count;
+    } else {
+      output.push(group.words[index].text);
+      index += 1;
+    }
+  }
+  return output.join(" ");
+}
+
+function filterUnrenderableCorrections(corrections, words) {
+  const lines = groupOcrWordsIntoLines(words);
+  const lineIndexById = new Map();
+  const positionById = new Map();
+  lines.forEach((line, lineIndex) => line.words.forEach((word, position) => {
+    lineIndexById.set(word.id, lineIndex);
+    positionById.set(word.id, position);
+  }));
+
+  return corrections.filter((correction) => {
+    if (correction.action === "rewrite_line") {
+      const lineIds = new Set(correction.target_ids.map((id) => lineIndexById.get(id)));
+      const positions = correction.target_ids.map((id) => positionById.get(id));
+      const sameLine = lineIds.size === 1 && !lineIds.has(undefined);
+      const consecutive = positions.every((position, index) => index === 0 || position === positions[index - 1] + 1);
+      if (!sameLine || !consecutive) {
+        console.warn("Gorselde guvenle yerlestirilemeyen cok satirli duzeltme atlandi:", correction.original, "->", correction.replacement);
+        return false;
+      }
+    }
+    if (correction.action === "insert") {
+      const leftLine = lineIndexById.get(correction.left_id);
+      const rightLine = lineIndexById.get(correction.right_id);
+      if (leftLine === undefined || leftLine !== rightLine) {
+        console.warn("Farkli fiziksel satirlar arasindaki ekleme atlandi:", correction.replacement);
+        return false;
+      }
+    }
+    return true;
+  });
+}
+
+function isSafeModelRewrite(targetWords, replacementTokens) {
+  if (!targetWords.length || targetWords.length > 6) return false;
+  if (!replacementTokens.length || replacementTokens.length > 6) return false;
+  return replacementTokens.every((token) => /^[A-Za-z]+(?:'[A-Za-z]+)?$/.test(token));
 }
 
 function isSafeCorrection(correction) {
   if (correction.action === "rewrite_line") {
     return Array.isArray(correction.target_ids)
-      && correction.target_ids.length >= 2
+      && correction.target_ids.length >= 1
+      && correction.target_ids.length <= 6
       && Boolean(correction.replacement);
   }
   if (correction.action === "insert") {
-    return /^[A-Za-z']{1,3}$/.test(correction.replacement)
+    const safeGrammarInsertion = new Set([
+      "a", "an", "the", "is", "am", "are", "was", "were", "be", "been",
+      "has", "have", "had", "do", "does", "did", "will", "would", "that", "i"
+    ]);
+    const inserted = tokenize(correction.replacement).map((token) => token.toLowerCase());
+    return inserted.length >= 1
+      && inserted.length <= 3
+      && inserted.every((token) => safeGrammarInsertion.has(token))
       && Boolean(correction.left_id)
       && Boolean(correction.right_id);
   }
@@ -1642,10 +1970,11 @@ function pluralizeCountNoun(noun) {
 function mergeCorrections(...groups) {
   const merged = [];
   const seen = new Set();
-  const rewrittenIds = new Set();
+  const claimedIds = new Set();
   for (const item of groups.flat()) {
-    if (item.action === "replace" && rewrittenIds.has(item.target_id)) continue;
-    if (item.action === "insert" && rewrittenIds.has(item.left_id) && rewrittenIds.has(item.right_id)) continue;
+    if (item.action === "replace" && claimedIds.has(item.target_id)) continue;
+    if (item.action === "rewrite_line" && (item.target_ids || []).some((id) => claimedIds.has(id))) continue;
+    if (item.action === "insert" && claimedIds.has(item.left_id) && claimedIds.has(item.right_id)) continue;
     const key = item.action === "replace"
       ? `replace|${item.target_id}`
       : item.action === "rewrite_line"
@@ -1654,8 +1983,9 @@ function mergeCorrections(...groups) {
     if (seen.has(key)) continue;
     seen.add(key);
     merged.push(item);
+    if (item.action === "replace") claimedIds.add(item.target_id);
     if (item.action === "rewrite_line") {
-      for (const id of item.target_ids) rewrittenIds.add(id);
+      for (const id of item.target_ids) claimedIds.add(id);
     }
   }
   return merged;
@@ -1812,6 +2142,7 @@ module.exports = {
   attachOcrAnchors,
   buildOcrLines,
   buildSentenceGroups,
+  correctionsFromGeminiEdits,
   correctSentenceGroupWithGemini,
   detectAdvancedGrammar,
   detectDeterministicGrammar,
@@ -1819,12 +2150,15 @@ module.exports = {
   enforceParallelCorrectionForms,
   filterLikelyOcrArtifacts,
   filterProtectedProperNames,
+  filterUnrenderableCorrections,
   groupOcrWordsIntoLines,
   lineClearlyContinues,
   isSafeCorrection,
   normalizeOcrNumber,
   organizeSentenceGroupsWithGemini,
   mergeCorrections,
+  normalizeGeminiEdits,
+  parseGeminiJson,
   recognizeWords,
   recognizeGoogleWords,
   parseGoogleVisionWords,

@@ -1,3 +1,4 @@
+import json
 import sys
 
 import cv2
@@ -144,9 +145,23 @@ def find_paper(image):
 
 def crop_around_handwriting(image):
     blue, green, red = cv2.split(image)
-    ink = ((blue.astype(np.int16) - red.astype(np.int16) > 14) &
-           (blue.astype(np.int16) - green.astype(np.int16) > 3) &
-           (blue < 225)).astype(np.uint8) * 255
+    blue_ink = ((blue.astype(np.int16) - red.astype(np.int16) > 14) &
+                (blue.astype(np.int16) - green.astype(np.int16) > 3) &
+                (blue < 225))
+    # Siyah/kurşun kalem için yalnız renk farkına güvenemeyiz. Açık kâğıt
+    # üzerinde yerel arka plandan belirgin biçimde koyu ince darbeleri ekle;
+    # siyah masa ve klavye bu parlaklık kapısı sayesinde aday olmaz.
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    local_background = cv2.morphologyEx(
+        gray, cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+    )
+    dark_ink = ((local_background.astype(np.int16) - gray.astype(np.int16) > 22)
+                & (local_background > 125))
+    # Renkli kalem yeterince belirginse daha geniş koyu-nesne maskesini
+    # karıştırma; aksi halde klavye tuşları el yazısı bandına dönüşebilir.
+    ink_source = blue_ink if np.count_nonzero(blue_ink) >= 80 else dark_ink
+    ink = (ink_source.astype(np.uint8) * 255)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
     ink = cv2.morphologyEx(ink, cv2.MORPH_OPEN, kernel)
     # A pen, logo or isolated scribble outside the sheet must not enlarge the
@@ -167,9 +182,18 @@ def crop_around_handwriting(image):
     for label in range(1, count):
         band_y = int(stats[label, cv2.CC_STAT_TOP])
         band_height = int(stats[label, cv2.CC_STAT_HEIGHT])
+        band_points = cv2.findNonZero(ink[band_y:band_y + band_height])
+        if band_points is None:
+            continue
+        _, _, band_width, _ = cv2.boundingRect(band_points)
         strength = int(row_strength[band_y:band_y + band_height].sum())
-        if band_height >= image.shape[0] * 0.08:
-            bands.append((strength * np.sqrt(band_height), band_y, band_height))
+        # A large blue logo can contain more ink than a short handwritten
+        # sentence. Handwriting normally spreads horizontally, whereas logos
+        # and isolated marks are more compact. Score the horizontal span and
+        # accept single-line text instead of requiring a tall multi-line band.
+        if (band_height >= max(20, image.shape[0] * 0.025)
+                and band_width >= image.shape[1] * 0.25):
+            bands.append((band_width * np.sqrt(band_height), band_y, band_height))
     if bands:
         _, band_y, band_height = max(bands, key=lambda item: item[0])
         band_mask = np.zeros_like(ink)
@@ -187,7 +211,21 @@ def crop_around_handwriting(image):
     x2 = min(image_width, x + width + pad_x)
     y1 = max(0, y - pad_top)
     y2 = min(image_height, y + height + pad_bottom)
+    # Yazı sayfanın üstündeyse kâğıdın kalan boş kısmını kesmeyelim. Sonuç
+    # yalnız yazı şeridi değil, üzerinde düzeltme yapılacak gerçek sayfa olsun.
+    below_start = min(image_height, y + height + max(8, int(image_height * .02)))
+    if below_start < image_height:
+        centre_left, centre_right = int(image_width * .3), int(image_width * .7)
+        below = gray[below_start:image_height, centre_left:centre_right]
+        if below.size and np.median(below) > 115:
+            y2 = image_height
     if (x2 - x1) < 300 or (y2 - y1) < 300:
+        return image
+    # Never return a narrow off-centre strip. This means the colour detector
+    # locked onto a logo or one thick word and would remove OCR context.
+    crop_width_ratio = (x2 - x1) / image_width
+    crop_centre_x = (x1 + x2) / 2.0
+    if crop_width_ratio < 0.48 or abs(crop_centre_x - image_width / 2.0) > image_width * 0.24:
         return image
     return image[y1:y2, x1:x2]
 
@@ -234,6 +272,7 @@ def main():
         raise SystemExit("image could not be decoded")
     quad = find_paper(image)
     output = warp_paper(image, quad) if quad is not None else crop_around_handwriting(image)
+    cropped = quad is not None or output.shape[:2] != image.shape[:2]
     # Full-resolution PNG photographs make every OCR/AI request unnecessarily
     # large. Preserve enough handwriting detail while capping transfer size.
     max_dimension = 2200
@@ -243,6 +282,7 @@ def main():
     parameters = [cv2.IMWRITE_JPEG_QUALITY, 90] if output_path.lower().endswith((".jpg", ".jpeg")) else [cv2.IMWRITE_PNG_COMPRESSION, 3]
     if not cv2.imwrite(output_path, output, parameters):
         raise SystemExit("output image could not be written")
+    print(json.dumps({"cropped": bool(cropped)}))
 
 
 if __name__ == "__main__":

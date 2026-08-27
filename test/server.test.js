@@ -4,17 +4,21 @@ const assert = require("node:assert/strict");
 const {
   attachOcrAnchors,
   buildSentenceGroups,
+  correctionsFromGeminiEdits,
   detectAdvancedGrammar,
   detectDeterministicGrammar,
   diffLineToCorrections,
   enforceParallelCorrectionForms,
   filterLikelyOcrArtifacts,
   filterProtectedProperNames,
+  filterUnrenderableCorrections,
   groupOcrWordsIntoLines,
   isSafeCorrection,
   mergeCorrections,
+  normalizeGeminiEdits,
   normalizeOcrNumber,
   organizeSentenceGroupsWithGemini,
+  parseGeminiJson,
   parseGoogleVisionWords,
   selectGoogleHandwrittenWords,
   selectHandwrittenWords
@@ -27,6 +31,27 @@ function sentence(texts) {
     text: texts.join(" ")
   }];
 }
+
+test("Gemini JSON parser repairs fenced responses and trailing commas", () => {
+  assert.deepEqual(parseGeminiJson(`\`\`\`json
+  {"corrected":"Hello my name is Ahmet", "edits": [],}
+  \`\`\``), {
+    corrected: "Hello my name is Ahmet",
+    edits: []
+  });
+});
+
+test("an incomplete Gemini edit falls back to corrected-sentence alignment without retrying", () => {
+  const group = sentence(["My", "name", "Ahmet"])[0];
+  assert.deepEqual(normalizeGeminiEdits(group, [{
+    target_ids: [], left_id: "s1", right_id: "s2"
+  }]), []);
+  const corrections = correctionsFromGeminiEdits(group, [], "My name is Ahmet")
+    || diffLineToCorrections(group, "My name is Ahmet");
+  assert.equal(corrections.length, 1);
+  assert.equal(corrections[0].action, "insert");
+  assert.equal(corrections[0].replacement, "is");
+});
 
 test("inpainting anchors are clipped between neighboring text-line centers", () => {
   const words = [
@@ -157,6 +182,42 @@ test("an incomplete coordinate layout retries with the photograph", async () => 
   } finally {
     global.fetch = originalFetch;
   }
+});
+
+test("a duplicate or invented Gemini layout ID does not discard valid OCR layout", async () => {
+  const originalFetch = global.fetch;
+  let requestCount = 0;
+  global.fetch = async () => {
+    requestCount += 1;
+    return {
+      ok: true,
+      json: async () => ({
+        candidates: [{ content: { parts: [{ text: JSON.stringify({
+          lines: [{ word_ids: ["w1", "imaginary", "w2", "w2"] }],
+          sentences: [{ word_ids: ["w1", "w2", "imaginary"] }]
+        }) }] } }]
+      })
+    };
+  };
+  try {
+    const result = await organizeSentenceGroupsWithGemini(
+      "data:image/jpeg;base64,AA==",
+      [word("w1", "She", 100), word("w2", "reads", 180)]
+    );
+    assert.equal(result.source, "coordinates");
+    assert.equal(requestCount, 1);
+    assert.deepEqual(result.groups[0].words.map((item) => item.id), ["w1", "w2"]);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test("a full punctuation-free line can wrap before a lowercase continuation", () => {
+  const lines = [
+    { id: "line_1", words: [word("w1", "My", 80), word("w2", "brother", 180), word("w3", "said", 320), word("w4", "he", 720)] },
+    { id: "line_2", words: [word("w5", "wanted", 80, 160), word("w6", "to", 200, 160), word("w7", "leave", 280, 160)] }
+  ];
+  assert.equal(buildSentenceGroups(lines).length, 1);
 });
 
 test("Google OCR ignores keyboard rows before selecting handwriting", () => {
@@ -422,6 +483,17 @@ test("a proper name in the sentence is never replaced", () => {
   assert.deepEqual(filterProtectedProperNames(corrections, groups).map((item) => item.target_id), ["w1"]);
 });
 
+test("a phrase rewrite cannot erase a protected proper name", () => {
+  const groups = [{ words: [word("w1", "My", 10), word("w2", "name", 70), word("w3", "is", 150), word("w4", "Arda", 200)] }];
+  const corrections = [{
+    action: "rewrite_line",
+    original: "is Arda",
+    replacement: "is Ada",
+    target_ids: ["w3", "w4"]
+  }];
+  assert.deepEqual(filterProtectedProperNames(corrections, groups), []);
+});
+
 test("the missing verb after my name survives a curved-line grouping failure", () => {
   const words = [
     { ...word("w1", "My", 100, 110), layoutLine: "split_a" },
@@ -580,7 +652,7 @@ test("insertions require both neighboring OCR anchors", () => {
   assert.equal(isSafeCorrection({ action: "insert", replacement: "and", left_id: "w4", right_id: "" }), false);
 });
 
-test("model insertions are discarded before deterministic rules are merged", () => {
+test("validated grammar-word insertions survive before deterministic rules are merged", () => {
   const modelCorrections = [
     { action: "insert", replacement: "am", left_id: "w1", right_id: "w2" },
     { action: "insert", replacement: "a", left_id: "w2", right_id: "w3" },
@@ -588,13 +660,99 @@ test("model insertions are discarded before deterministic rules are merged", () 
   ];
   assert.deepEqual(
     filterLikelyOcrArtifacts(modelCorrections).map((item) => `${item.action}:${item.replacement}`),
-    ["insert:a", "replace:favorite"]
+    ["insert:am", "insert:a", "replace:favorite"]
   );
+});
+
+test("multi-word grammar changes remain one anchored rewrite block", () => {
+  const group = sentence(["My", "brother", "doesn't", "enjoy", "to", "read", "books"])[0];
+  const corrections = diffLineToCorrections(group, "My brother doesn't enjoy reading books");
+  assert.deepEqual(
+    corrections.map(({ action, original, replacement, target_ids }) => ({
+      action, original, replacement, target_ids
+    })),
+    [{
+      action: "rewrite_line",
+      original: "to read",
+      replacement: "reading",
+      target_ids: ["s4", "s5"]
+    }]
+  );
+});
+
+test("third conditional insertions and irregular participles survive model alignment", () => {
+  const group = sentence(["If", "I", "had", "knew", "I", "would", "studied"])[0];
+  const corrections = diffLineToCorrections(group, "If I had known I would have studied");
+  assert.deepEqual(
+    corrections.map((item) => `${item.action}:${item.original || "_"}->${item.replacement}`),
+    ["rewrite_line:knew->known", "insert:_->have"]
+  );
+});
+
+test("suggest complements are rewritten atomically instead of leaving the old to", () => {
+  const group = sentence(["She", "suggested", "me", "to", "go", "earlier"])[0];
+  const corrections = diffLineToCorrections(group, "She suggested that I go earlier");
+  assert.deepEqual(
+    corrections.map(({ action, original, replacement, target_ids }) => ({
+      action, original, replacement, target_ids
+    })),
+    [{
+      action: "rewrite_line",
+      original: "me to",
+      replacement: "that I",
+      target_ids: ["s2", "s3"]
+    }]
+  );
+});
+
+test("Gemini OCR-ID edits are used only when they exactly rebuild the validated sentence", () => {
+  const group = sentence(["My", "brother", "enjoy", "to", "read", "books"])[0];
+  const edits = [{
+    target_ids: ["s2", "s3", "s4"],
+    left_id: "",
+    right_id: "",
+    replacement: "enjoys reading"
+  }];
+  const corrections = correctionsFromGeminiEdits(group, edits, "My brother enjoys reading books");
+  assert.deepEqual(corrections.map(({ action, target_ids, replacement }) => ({ action, target_ids, replacement })), [{
+    action: "rewrite_line",
+    target_ids: ["s2", "s3", "s4"],
+    replacement: "enjoys reading"
+  }]);
+  assert.equal(correctionsFromGeminiEdits(group, edits, "My brother enjoys books"), null);
+});
+
+test("a single rendered rewrite cannot erase words from two physical lines", () => {
+  const words = [
+    { ...word("w1", "will", 100, 100), layoutLine: "line_1" },
+    { ...word("w2", "rain", 180, 100), layoutLine: "line_1" },
+    { ...word("w3", "we", 100, 210), layoutLine: "line_2" },
+    { ...word("w4", "stay", 160, 210), layoutLine: "line_2" }
+  ];
+  const correction = {
+    action: "rewrite_line",
+    original: "will rain we stay",
+    replacement: "rains we will stay",
+    target_ids: ["w1", "w2", "w3", "w4"]
+  };
+  assert.deepEqual(filterUnrenderableCorrections([correction], words), []);
 });
 
 test("only one replacement can target a word and deterministic correction wins", () => {
   const deterministic = { action: "replace", original: "year", replacement: "years", target_id: "w4", left_id: "", right_id: "" };
   const model = { action: "replace", original: "year", replacement: "old", target_id: "w4", left_id: "", right_id: "" };
+  assert.deepEqual(mergeCorrections([deterministic], [model]), [deterministic]);
+});
+
+test("a model phrase rewrite cannot overwrite a higher-priority anchored correction", () => {
+  const deterministic = { action: "replace", original: "knew", replacement: "known", target_id: "w4", left_id: "", right_id: "" };
+  const model = {
+    action: "rewrite_line",
+    original: "had knew",
+    replacement: "had known",
+    target_ids: ["w3", "w4"],
+    target_id: "", left_id: "", right_id: ""
+  };
   assert.deepEqual(mergeCorrections([deterministic], [model]), [deterministic]);
 });
 

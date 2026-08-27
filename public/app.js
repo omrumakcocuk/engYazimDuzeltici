@@ -6,6 +6,8 @@ const dropzone = document.querySelector("#dropzone");
 const editor = document.querySelector("#editor");
 const status = document.querySelector("#status");
 const fileName = document.querySelector("#fileName");
+const CORRECTION_FONT_FAMILY = 'Caveat, "Comic Sans MS", cursive';
+let correctionFontReady = null;
 
 const providers = ["gemini"].map((name) => {
   const canvas = document.querySelector(`#${name}Canvas`);
@@ -107,13 +109,20 @@ async function runProvider(provider) {
       provider.canvas.width = provider.processedImage.naturalWidth;
       provider.canvas.height = provider.processedImage.naturalHeight;
     }
+    // Canvas does not repaint text when a web font finishes loading. Always
+    // settle the correction font before the first annotation so Gemini and
+    // fallback results cannot accidentally use different font families.
+    await ensureCorrectionFont();
     drawOriginal(provider);
     drawCorrections(provider, result.corrections);
     renderCorrectionList(provider, result.corrections);
     const count = result.corrections.length;
-    provider.status.textContent = count
+    const fallbackNote = result.analysis_source === "gemini_with_fallback"
+      ? ` (${result.fallback_groups?.length || 1} cümlede güvenli yedek kullanıldı.)`
+      : "";
+    provider.status.textContent = (count
       ? `${count} düzeltme fotoğrafın üzerine işlendi.`
-      : "Mektupta belirgin bir hata bulunamadı.";
+      : "Mektupta belirgin bir hata bulunamadı.") + fallbackNote;
     provider.downloadButton.hidden = false;
     return true;
   } catch (error) {
@@ -154,15 +163,18 @@ function drawCorrections(engine, corrections) {
       width = symmetricRoom * 2;
     }
     const lineHeight = placement.lineHeight || height;
-    const maximumFont = Math.max(12, Math.min(canvas.width, canvas.height) * .038);
+    // Size annotations from the OCR line in the *processed* image. Using the
+    // canvas' short edge here made text tiny after a wide, single-line photo
+    // was cropped (for example 906x426 capped every label near 16px).
+    const maximumFont = Math.max(12, canvas.width * .075);
     let fontSize = Math.max(9, Math.min(
-      lineHeight * (item.action === "insert" ? .72 : .84),
+      lineHeight * (item.action === "insert" ? .86 : .84),
       maximumFont
     ));
 
     ctx.save();
     ctx.fillStyle = "#d43f32";
-    ctx.font = `600 ${fontSize}px Caveat, "Comic Sans MS", cursive`;
+    ctx.font = `600 ${fontSize}px ${CORRECTION_FONT_FAMILY}`;
     // Fit phrases by reducing the font modestly. Never stretch short words and
     // never apply OCR polygon angles: handwriting polygons are too noisy for
     // reliable rotation, especially on a curved sheet.
@@ -173,18 +185,37 @@ function drawCorrections(engine, corrections) {
     const mayFitInsideSlot = item.action === "replace"
       || item.action === "rewrite_line"
       || (item.action === "insert" && placement.between);
+    const compactInsertion = item.action === "insert"
+      && !/\s/.test(item.replacement.trim())
+      && item.replacement.trim().length <= 4;
     let textWidth = ctx.measureText(item.replacement).width;
-    if (mayFitInsideSlot && textWidth > maximumTextWidth) {
-      fontSize = Math.max(8, fontSize * Math.max(.72, maximumTextWidth / textWidth));
-      ctx.font = `600 ${fontSize}px Caveat, "Comic Sans MS", cursive`;
+    if (mayFitInsideSlot && textWidth > maximumTextWidth && !compactInsertion) {
+      const minimumReadableFont = Math.max(7, lineHeight * .54);
+      fontSize = Math.max(minimumReadableFont, fontSize * maximumTextWidth / textWidth);
+      ctx.font = `600 ${fontSize}px ${CORRECTION_FONT_FAMILY}`;
       textWidth = ctx.measureText(item.replacement).width;
     }
-    const horizontalScale = mayFitInsideSlot
-      ? Math.min(1, Math.max(.84, maximumTextWidth / Math.max(1, textWidth)))
+    const requiredScale = maximumTextWidth / Math.max(1, textWidth);
+    const roomAbove = Number.isFinite(placement.safeTop) ? y - placement.safeTop : 0;
+    const roomBelow = Number.isFinite(placement.safeBottom)
+      ? placement.safeBottom - placement.baseline
+      : 0;
+    // “is/the/to” gibi dar aralığa eklenen kelimeleri okunmayacak kadar yatay
+    // sıkıştırmak yerine, aynı satırın güvenli boşluğuna tam ölçekte taşı.
+    const placeAbove = item.action === "insert" && placement.between
+      && requiredScale < .72 && roomAbove >= fontSize * .9;
+    const placeBelow = item.action === "insert" && placement.between
+      && !placeAbove && requiredScale < .72 && roomBelow >= fontSize * 1.05;
+    const horizontalScale = mayFitInsideSlot && !placeAbove && !placeBelow
+      ? Math.min(1, requiredScale)
       : 1;
     const paintedWidth = textWidth * horizontalScale;
     const labelX = item.action === "insert" ? x - paintedWidth / 2 : x + (width - paintedWidth) / 2;
-    const labelY = item.action === "insert" && placement.between
+    const labelY = placeAbove
+      ? Math.max(placement.safeTop + fontSize, y - fontSize * .12)
+      : placeBelow
+        ? Math.min(placement.safeBottom, placement.baseline + fontSize * 1.05)
+        : item.action === "insert" && placement.between
       ? placement.baseline - height * .04
       : (item.action === "replace" || item.action === "rewrite_line")
         ? (placement.lineBaseline || (y + height)) - lineHeight * .025
@@ -196,10 +227,26 @@ function drawCorrections(engine, corrections) {
   }
 }
 
+function ensureCorrectionFont() {
+  if (!document.fonts?.load) return Promise.resolve();
+  if (!correctionFontReady) {
+    correctionFontReady = Promise.all([
+      document.fonts.load(`600 32px ${CORRECTION_FONT_FAMILY}`),
+      document.fonts.ready
+    ]).catch(() => undefined);
+  }
+  return correctionFontReady;
+}
+
 function getRewritePlacement(anchors) {
-  const left = Math.min(...anchors.map((anchor) => anchor.x));
+  // A phrase owns the whitespace slots around all of its erased OCR words.
+  // This gives replacements enough room without borrowing space from a
+  // different physical line or centring them over an unrelated neighbour.
+  const left = Math.min(...anchors.map((anchor) => Number.isFinite(anchor.slotX) ? anchor.slotX : anchor.x));
   const top = Math.min(...anchors.map((anchor) => anchor.y));
-  const right = Math.max(...anchors.map((anchor) => anchor.x + anchor.width));
+  const right = Math.max(...anchors.map((anchor) => Number.isFinite(anchor.slotX) && Number.isFinite(anchor.slotWidth)
+    ? anchor.slotX + anchor.slotWidth
+    : anchor.x + anchor.width));
   const bottom = Math.max(...anchors.map((anchor) => anchor.y + anchor.height));
   const baselines = anchors.map((anchor) => anchor.lineBaseline).filter(Number.isFinite);
   const lineHeights = anchors.map((anchor) => anchor.lineHeight).filter(Number.isFinite);
@@ -231,6 +278,12 @@ function normalizedBoxToCanvas(engine, anchor) {
       : undefined,
     slotWidth: Number.isFinite(anchor.slotWidth)
       ? anchor.slotWidth * engine.canvas.width / engine.coordinateSpace.width
+      : undefined,
+    safeTop: Number.isFinite(anchor.safeTop)
+      ? anchor.safeTop * engine.canvas.height / engine.coordinateSpace.height
+      : undefined,
+    safeBottom: Number.isFinite(anchor.safeBottom)
+      ? anchor.safeBottom * engine.canvas.height / engine.coordinateSpace.height
       : undefined
   };
 }
@@ -250,6 +303,8 @@ function getInsertionPlacement(anchors) {
         || ((left.y + left.height) + (right.y + right.height)) / 2,
       lineBaseline: averageFinite([left.lineBaseline, right.lineBaseline]),
       lineHeight: averageFinite([left.lineHeight, right.lineHeight]),
+      safeTop: averageFinite([left.safeTop, right.safeTop]),
+      safeBottom: averageFinite([left.safeBottom, right.safeBottom]),
       between: true
     };
   }
@@ -260,6 +315,8 @@ function getInsertionPlacement(anchors) {
     width: Math.max(1, anchor.width * .2),
     height: anchor.height,
     baseline: anchor.y + anchor.height,
+    safeTop: anchor.safeTop,
+    safeBottom: anchor.safeBottom,
     between: false
   };
 }

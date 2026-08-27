@@ -42,8 +42,12 @@ def main():
             y = int(values[1] / 1000 * image_height)
             width = max(1, int(values[2] / 1000 * image_width))
             height = max(1, int(values[3] / 1000 * image_height))
-            pad_x = max(2, int(width * 0.035))
-            pad_y = max(2, int(height * 0.07))
+            # Vision boxes can end on the centre of the outer pen stroke,
+            # especially with cursive writing. Give the mask enough room to
+            # remove those strokes, then clip it to the whitespace shared with
+            # neighbouring words below.
+            pad_x = max(3, int(width * 0.12))
+            pad_y = max(3, int(height * 0.15))
             x1 = min(image_width, max(0, x - pad_x))
             y1 = min(image_height, max(0, y - pad_y))
             x2 = min(image_width, max(0, x + width + pad_x))
@@ -56,6 +60,14 @@ def main():
             if math.isfinite(safe_top) and math.isfinite(safe_bottom) and safe_top < safe_bottom:
                 y1 = max(y1, int(math.ceil(safe_top)))
                 y2 = min(y2, int(math.floor(safe_bottom)))
+            try:
+                safe_left = float(target.get("slotX", 0)) / 1000 * image_width
+                safe_right = safe_left + float(target.get("slotWidth", 1000)) / 1000 * image_width
+            except (TypeError, ValueError):
+                safe_left, safe_right = 0, image_width
+            if math.isfinite(safe_left) and math.isfinite(safe_right) and safe_left < safe_right:
+                x1 = max(x1, int(math.ceil(safe_left)))
+                x2 = min(x2, int(math.floor(safe_right)))
             if x1 >= x2 or y1 >= y2:
                 continue
 
@@ -67,17 +79,35 @@ def main():
             green16 = green.astype(np.int16)
             red16 = red.astype(np.int16)
             gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
-            paper_level = float(np.percentile(gray, 78))
+            paper_level = float(np.percentile(gray, 82))
+            background_kernel = max(9, int(round(min(region.shape[:2]) * 0.65)) | 1)
+            background = cv2.morphologyEx(
+                gray,
+                cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (background_kernel, background_kernel)),
+            )
+            local_contrast = background.astype(np.int16) - gray.astype(np.int16)
             # Dark-blue handwriting varies greatly with lighting. Use both
             # colour dominance and local darkness, while keeping the mask
             # restricted to the OCR word box so neighbouring lines survive.
             blue_ink = (
-                ((blue16 - red16 > 7) & (blue16 - green16 > 1) & (gray < paper_level - 8))
-                | ((blue16 - red16 > 3) & (gray < paper_level - 28))
+                ((blue16 - red16 > 4) & (blue16 - green16 > -3) & (gray < paper_level - 5))
+                | ((blue16 - red16 > 2) & (gray < paper_level - 22))
+                | (gray < paper_level - 48)
+                | ((local_contrast > 18) & (gray < paper_level - 4))
             )
             region_mask = (blue_ink.astype(np.uint8) * 255)
-            kernel_size = max(3, int(round(min(width, height) * 0.035)) | 1)
+            # Gürültü noktalarını değil kalem darbelerini temizle.
+            component_count, labels, stats, _ = cv2.connectedComponentsWithStats(region_mask, 8)
+            filtered = np.zeros_like(region_mask)
+            minimum_area = max(2, int(width * height * 0.0008))
+            for component in range(1, component_count):
+                if stats[component, cv2.CC_STAT_AREA] >= minimum_area:
+                    filtered[labels == component] = 255
+            region_mask = filtered
+            kernel_size = max(3, int(round(min(width, height) * 0.10)) | 1)
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+            region_mask = cv2.morphologyEx(region_mask, cv2.MORPH_CLOSE, kernel)
             region_mask = cv2.dilate(region_mask, kernel, iterations=1)
             full_mask[y1:y2, x1:x2] = cv2.max(full_mask[y1:y2, x1:x2], region_mask)
 
