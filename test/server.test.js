@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 
 const {
   attachOcrAnchors,
+  buildCorrectionTranscript,
   buildSentenceGroups,
   correctionsFromGeminiEdits,
   detectAdvancedGrammar,
@@ -21,7 +22,8 @@ const {
   parseGeminiJson,
   parseGoogleVisionWords,
   selectGoogleHandwrittenWords,
-  selectHandwrittenWords
+  selectHandwrittenWords,
+  trimRewriteToChangedSpan
 } = require("../server");
 
 function sentence(texts) {
@@ -304,6 +306,143 @@ test("a fronted lexical verb is deterministically reordered before a pronoun sub
     ]
   );
   assert.equal(corrections.some((item) => item.target_id === "w3"), false);
+});
+
+test("the typed transcript drops wrong words entirely and marks only the correction red", () => {
+  const group = sentence(["My", "brother", "enjoy", "read", "books"])[0];
+  const corrections = [
+    { action: "replace", original: "enjoy", replacement: "enjoys", target_id: "s2", left_id: "", right_id: "" },
+    { action: "insert", original: "", replacement: "to", reason: "", target_id: "", left_id: "s3", right_id: "s4" }
+  ];
+  const transcript = buildCorrectionTranscript([group], corrections);
+  assert.deepEqual(transcript, [
+    { text: "My", changed: false },
+    { text: "brother", changed: false },
+    { text: "enjoys", changed: true },
+    { text: "read", changed: false },
+    { text: "to", changed: true },
+    { text: "books", changed: false }
+  ]);
+});
+
+test("the typed transcript drops a pure word deletion instead of leaving a blank token", () => {
+  const group = sentence(["Although", "it", "was", "hot", "but", "everyone", "smiled"])[0];
+  const corrections = [
+    { action: "replace", original: "but", replacement: "", target_id: "s4", left_id: "", right_id: "" }
+  ];
+  const transcript = buildCorrectionTranscript([group], corrections);
+  assert.deepEqual(transcript.map((token) => token.text), ["Although", "it", "was", "hot", "everyone", "smiled"]);
+  assert.equal(transcript.some((token) => token.text === ""), false);
+});
+
+test("the typed transcript collapses a rewrite_line's whole phrase into one red replacement", () => {
+  const group = sentence(["My", "brother", "enjoy", "to", "read", "books"])[0];
+  const corrections = [{
+    action: "rewrite_line", original: "enjoy to read", replacement: "enjoys reading",
+    target_ids: ["s2", "s3", "s4"], target_id: "", left_id: "", right_id: ""
+  }];
+  const transcript = buildCorrectionTranscript([group], corrections);
+  assert.deepEqual(transcript, [
+    { text: "My", changed: false },
+    { text: "brother", changed: false },
+    { text: "enjoys reading", changed: true },
+    { text: "books", changed: false }
+  ]);
+});
+
+test("a redundant more before a comparative adjective is merged into one rewrite", () => {
+  const words = [
+    word("w1", "It", 10), word("w2", "was", 80), word("w3", "more", 150), word("w4", "better", 230)
+  ];
+  const correction = detectDeterministicGrammar(words).find((item) => item.action === "rewrite_line");
+  assert.ok(correction);
+  assert.deepEqual(correction.target_ids, ["w3", "w4"]);
+  assert.equal(correction.replacement, "better");
+});
+
+test("more before an unrelated -er word is never touched", () => {
+  const words = [
+    word("w1", "I", 10), word("w2", "like", 80), word("w3", "more", 150), word("w4", "water", 230)
+  ];
+  assert.equal(
+    detectDeterministicGrammar(words).some((item) => item.action === "rewrite_line"),
+    false
+  );
+});
+
+test("a present-perfect auxiliary before a simple-past-only verb is dropped", () => {
+  const words = [
+    word("w1", "I", 10), word("w2", "have", 80), word("w3", "saw", 150), word("w4", "many", 230), word("w5", "birds", 310)
+  ];
+  const correction = detectDeterministicGrammar(words).find((item) => item.action === "rewrite_line");
+  assert.ok(correction);
+  assert.deepEqual(correction.target_ids, ["w2", "w3"]);
+  assert.equal(correction.replacement, "saw");
+});
+
+test("have/has/had before a verb whose participle matches the past tense is left alone", () => {
+  const words = [
+    word("w1", "She", 10), word("w2", "has", 80), word("w3", "made", 150), word("w4", "a", 230), word("w5", "cake", 310)
+  ];
+  assert.equal(
+    detectDeterministicGrammar(words).some((item) => item.action === "rewrite_line"),
+    false
+  );
+});
+
+test("a rewrite_line carrying an unchanged edge word for a pure deletion shrinks to a single-word replace", () => {
+  const correction = {
+    action: "rewrite_line", original: "was grew", replacement: "grew",
+    reason: "", target_ids: ["w1", "w2"], target_id: "", left_id: "", right_id: ""
+  };
+  assert.deepEqual(trimRewriteToChangedSpan(correction), {
+    action: "replace", original: "was", replacement: "", reason: "", target_id: "w1", left_id: "", right_id: ""
+  });
+});
+
+test("a rewrite_line with unchanged words on both edges shrinks to just the changed middle word", () => {
+  const correction = {
+    action: "rewrite_line", original: "the old book", replacement: "the new book",
+    reason: "", target_ids: ["w1", "w2", "w3"], target_id: "", left_id: "", right_id: ""
+  };
+  assert.deepEqual(trimRewriteToChangedSpan(correction), {
+    action: "replace", original: "old", replacement: "new", reason: "", target_id: "w2", left_id: "", right_id: ""
+  });
+});
+
+test("a rewrite_line with no unchanged edge words is left untouched", () => {
+  const correction = {
+    action: "rewrite_line", original: "enjoy to read", replacement: "enjoys reading",
+    reason: "", target_ids: ["w1", "w2", "w3"], target_id: "", left_id: "", right_id: ""
+  };
+  assert.deepEqual(trimRewriteToChangedSpan(correction), correction);
+});
+
+test("trimRewriteToChangedSpan leaves non-rewrite_line corrections alone", () => {
+  const correction = { action: "replace", original: "was", replacement: "were", target_id: "w1", left_id: "", right_id: "" };
+  assert.deepEqual(trimRewriteToChangedSpan(correction), correction);
+});
+
+test("a fronted lexical verb with a noun-phrase subject is reordered", () => {
+  const words = [
+    word("w1", "Enjoys", 10), word("w2", "my", 90), word("w3", "father", 160),
+    word("w4", "fishing", 240), word("w5", "every", 320), word("w6", "weekend", 400)
+  ];
+  const correction = detectDeterministicGrammar(words).find((item) => item.action === "rewrite_line");
+  assert.ok(correction);
+  assert.deepEqual(correction.target_ids, ["w1", "w2", "w3"]);
+  assert.equal(correction.replacement, "My father enjoys");
+});
+
+test("a fronted lexical verb followed by an object noun phrase is left alone", () => {
+  const words = [
+    word("w1", "He", 10), word("w2", "enjoys", 90), word("w3", "the", 160),
+    word("w4", "reptile", 240), word("w5", "house", 320)
+  ];
+  assert.equal(
+    detectDeterministicGrammar(words).some((item) => item.action === "rewrite_line"),
+    false
+  );
 });
 
 test("a word-order error is found after another clause on the same physical line", () => {
@@ -735,7 +874,7 @@ test("a single rendered rewrite cannot erase words from two physical lines", () 
     replacement: "rains we will stay",
     target_ids: ["w1", "w2", "w3", "w4"]
   };
-  assert.deepEqual(filterUnrenderableCorrections([correction], words), []);
+  assert.deepEqual(filterUnrenderableCorrections([correction], words), { renderable: [], dropped: 1 });
 });
 
 test("only one replacement can target a word and deterministic correction wins", () => {

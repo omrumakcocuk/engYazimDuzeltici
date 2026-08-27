@@ -5,3 +5,4 @@ service-account.json
 node_modules/
 .venv/
 npm-debug.log*
+debug_last_corrections.json
