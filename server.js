@@ -136,8 +136,8 @@ async function correctLetter(req, res) {
     words = selectGoogleHandwrittenWords(recognizedWords);
     if (process.env.DEBUG_CORRECTIONS) {
       fs.writeFileSync(path.join(__dirname, "debug_raw_words.json"), JSON.stringify({
-        recognizedWords: recognizedWords.map((w) => ({ text: w.text, x: w.x, y: w.y, width: w.width, height: w.height, leadingQuote: w.leadingQuote, trailingQuote: w.trailingQuote, punct: w.punct })),
-        selectedWords: words.map((w) => ({ text: w.text, x: w.x, y: w.y, width: w.width, height: w.height, leadingQuote: w.leadingQuote, trailingQuote: w.trailingQuote, punct: w.punct }))
+        recognizedWords: recognizedWords.map((w) => ({ text: w.text, x: w.x, y: w.y, width: w.width, height: w.height })),
+        selectedWords: words.map((w) => ({ text: w.text, x: w.x, y: w.y, width: w.width, height: w.height }))
       }, null, 2));
     }
   } catch (error) {
@@ -364,42 +364,18 @@ function parseGoogleVisionWords(annotationResponse) {
   // with their own position instead and attach each to its nearest real
   // neighbour by actual coordinates once every word is known.
   const standaloneMarks = [];
-  // Quotation marks are preserved (never added or corrected - see
-  // isApostropheOnlyFix-style scoping decisions elsewhere in this file):
-  // a quote the student already wrote in the right place should not
-  // silently vanish just because the punctuation model below only ever
-  // expected a single trailing mark. An opening quote glues to the front
-  // of the word it introduces; a closing one glues to the end of the word
-  // it follows, after any sentence punctuation that word already carries.
-  const QUOTE_CHAR = /["“”„‟]/;
-  const standaloneQuotes = [];
   for (const page of pages) {
     const pageWidth = Math.max(1, Number(page.width) || 1);
     const pageHeight = Math.max(1, Number(page.height) || 1);
     for (const block of page.blocks || []) {
       for (const paragraph of block.paragraphs || []) {
         for (const googleWord of paragraph.words || []) {
-          let rawText = (googleWord.symbols || []).map((symbol) => symbol.text || "").join("").trim();
+          const rawText = (googleWord.symbols || []).map((symbol) => symbol.text || "").join("").trim();
           if (!rawText) continue;
-          const isStandaloneQuote = new RegExp(`^${QUOTE_CHAR.source}+$`).test(rawText);
-          let leadingQuote = "";
-          let trailingQuote = "";
-          if (!isStandaloneQuote) {
-            const leadingMatch = rawText.match(new RegExp(`^${QUOTE_CHAR.source}+`));
-            if (leadingMatch) {
-              leadingQuote = "“";
-              rawText = rawText.slice(leadingMatch[0].length);
-            }
-            const trailingQuoteMatch = rawText.match(new RegExp(`${QUOTE_CHAR.source}+$`));
-            if (trailingQuoteMatch) {
-              trailingQuote = "”";
-              rawText = rawText.slice(0, -trailingQuoteMatch[0].length);
-            }
-          }
-          const isStandaloneMark = !isStandaloneQuote && /^[.,!?]+$/.test(rawText);
+          const isStandaloneMark = /^[.,!?]+$/.test(rawText);
           const punctMatch = isStandaloneMark ? null : rawText.match(/[.,!?]+$/);
-          const text = (isStandaloneMark || isStandaloneQuote) ? "" : rawText.replace(/[.,!?]+$/, "");
-          if (!isStandaloneMark && !isStandaloneQuote && !text) continue;
+          const text = isStandaloneMark ? "" : rawText.replace(/[.,!?]+$/, "");
+          if (!isStandaloneMark && !text) continue;
           const pixelVertices = googleWord.boundingBox?.vertices || [];
           const unitVertices = googleWord.boundingBox?.normalizedVertices || [];
           const usesNormalizedVertices = pixelVertices.length === 0 && unitVertices.length > 0;
@@ -422,13 +398,6 @@ function parseGoogleVisionWords(annotationResponse) {
             });
             continue;
           }
-          if (isStandaloneQuote) {
-            standaloneQuotes.push({
-              x: left / pageWidth * 1000,
-              y: (top + bottom) / 2 / pageHeight * 1000
-            });
-            continue;
-          }
           words.push({
             id: `w${words.length}`,
             text,
@@ -437,9 +406,7 @@ function parseGoogleVisionWords(annotationResponse) {
             width: (right - left) / pageWidth * 1000,
             height: (bottom - top) / pageHeight * 1000,
             confidence: Number(googleWord.confidence) || 0,
-            ...(punctMatch ? { punct: normalizePunctuationMark(punctMatch[0]) } : {}),
-            ...(leadingQuote ? { leadingQuote } : {}),
-            ...(trailingQuote ? { trailingQuote } : {})
+            ...(punctMatch ? { punct: normalizePunctuationMark(punctMatch[0]) } : {})
           });
         }
       }
@@ -462,32 +429,6 @@ function parseGoogleVisionWords(annotationResponse) {
       }
     }
     if (nearest) nearest.punct = mark.mark;
-  }
-  for (const quote of standaloneQuotes) {
-    // A standalone quote glyph could open the word to its right or close
-    // the word to its left - unlike a period or comma, it has no fixed
-    // side. Whichever neighbour it sits flush against (the smaller gap)
-    // wins; a large gap on both sides means no confident match, so the
-    // quote is dropped rather than guessed onto the wrong word.
-    let closestLeft = null;
-    let closestLeftGap = Infinity;
-    let closestRight = null;
-    let closestRightGap = Infinity;
-    for (const word of words) {
-      const wordMidY = word.y + word.height / 2;
-      if (Math.abs(wordMidY - quote.y) > word.height * 0.8) continue;
-      const wordRight = word.x + word.width;
-      if (wordRight <= quote.x + word.width * 0.2) {
-        const gap = quote.x - wordRight;
-        if (gap < closestLeftGap) { closestLeftGap = gap; closestLeft = word; }
-      }
-      if (word.x >= quote.x - word.width * 0.2) {
-        const gap = word.x - quote.x;
-        if (gap < closestRightGap) { closestRightGap = gap; closestRight = word; }
-      }
-    }
-    if (closestLeftGap <= closestRightGap && closestLeft) closestLeft.trailingQuote = "”";
-    else if (closestRight) closestRight.leadingQuote = "“";
   }
   return words;
 }
@@ -1584,32 +1525,23 @@ function buildCorrectionTranscript(sentenceGroups, corrections, punctuationByWor
   // is represented as a replace/rewrite_line with an empty replacement, which
   // erases the word on the photo but must not become an empty token here -
   // an empty token would still take up a join space and leave a double gap.
-  const pushIfPresent = (tokens, text, reason, leadingQuote) => {
-    if (text && text.trim()) {
-      tokens.push({ text, changed: true, reason: reason || "", punct: "", punctChanged: false, leadingQuote: leadingQuote || "", trailingQuote: "" });
-    }
+  const pushIfPresent = (tokens, text, reason) => {
+    if (text && text.trim()) tokens.push({ text, changed: true, reason: reason || "", punct: "", punctChanged: false });
   };
   const tokens = [];
   for (const group of sentenceGroups) {
     for (const word of group.words) {
-      // A quote mark is preserved as-is regardless of whether the word it
-      // wraps also got corrected: it is structural (part of the letter's
-      // punctuation), not tied to that word's specific spelling, so it
-      // rides along on whatever token ends up representing this word slot.
       if (rewriteStartById.has(word.id)) {
         const correction = rewriteStartById.get(word.id);
-        pushIfPresent(tokens, correction.replacement, correction.reason, word.leadingQuote);
+        pushIfPresent(tokens, correction.replacement, correction.reason);
       } else if (rewriteClaimed.has(word.id)) {
         // Already emitted as part of the rewrite phrase above; the original
         // wrong word is dropped entirely rather than shown struck through.
       } else if (replaceById.has(word.id)) {
         const correction = replaceById.get(word.id);
-        pushIfPresent(tokens, correction.replacement, correction.reason, word.leadingQuote);
+        pushIfPresent(tokens, correction.replacement, correction.reason);
       } else {
-        tokens.push({
-          text: word.text, changed: false, reason: "", punct: "", punctChanged: false,
-          leadingQuote: word.leadingQuote || "", trailingQuote: ""
-        });
+        tokens.push({ text: word.text, changed: false, reason: "", punct: "", punctChanged: false });
       }
       // Punctuation binds tightly to the word it follows (no space before
       // it), regardless of whether that word's own text was also replaced,
@@ -1637,7 +1569,6 @@ function buildCorrectionTranscript(sentenceGroups, corrections, punctuationByWor
             last.punctChanged = true;
           }
         }
-        if (word.trailingQuote) tokens[tokens.length - 1].trailingQuote = word.trailingQuote;
       }
       if (insertByLeftId.has(word.id)) {
         const correction = insertByLeftId.get(word.id);

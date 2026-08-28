@@ -157,35 +157,6 @@ test("trailing punctuation attached to a word is captured separately from its te
   assert.equal(words[1].punct, ".");
 });
 
-test("a quote mark attached directly to a word's OCR text is captured as leading/trailing, not lost", () => {
-  const words = parseGoogleVisionWords({
-    fullTextAnnotation: { pages: [{ width: 200, height: 100, blocks: [{ paragraphs: [{ words: [
-      visionWord('"hello', 0),
-      visionWord('fine,"', 20)
-    ] }] }] }] }
-  });
-  assert.equal(words[0].text, "hello");
-  assert.equal(words[0].leadingQuote, "“");
-  assert.equal(words[1].text, "fine");
-  assert.equal(words[1].punct, ",");
-  assert.equal(words[1].trailingQuote, "”");
-});
-
-test("a standalone quote glyph attaches to whichever neighboring word it sits flush against", () => {
-  const words = parseGoogleVisionWords({
-    fullTextAnnotation: { pages: [{ width: 200, height: 100, blocks: [{ paragraphs: [{ words: [
-      visionWord('"', 0),
-      visionWord("we'll", 12),
-      visionWord("be", 60),
-      visionWord("fine,", 90),
-      visionWord('"', 130)
-    ] }] }] }] }
-  });
-  const byText = Object.fromEntries(words.map((w) => [w.text, w]));
-  assert.equal(byText["we'll"].leadingQuote, "“");
-  assert.equal(byText.fine.trailingQuote, "”");
-});
-
 test("a standalone punctuation symbol attaches to its nearest word by position", () => {
   const words = parseGoogleVisionWords({
     fullTextAnnotation: { pages: [{ width: 100, height: 100, blocks: [{ paragraphs: [{ words: [
@@ -302,12 +273,12 @@ test("the typed transcript adds a missing comma without altering an unrelated wo
   const punctuationByWordId = new Map([["s3", ","]]);
   const transcript = buildCorrectionTranscript([group], corrections, punctuationByWordId);
   assert.deepEqual(transcript, [
-    { text: "My", changed: false, reason: "", punct: "", punctChanged: false, leadingQuote: "", trailingQuote: "" },
-    { text: "sister", changed: false, reason: "", punct: "", punctChanged: false, leadingQuote: "", trailingQuote: "" },
-    { text: "enjoys", changed: true, reason: "", punct: "", punctChanged: false, leadingQuote: "", trailingQuote: "" },
-    { text: "cats", changed: false, reason: "", punct: ",", punctChanged: true, leadingQuote: "", trailingQuote: "" },
-    { text: "and", changed: false, reason: "", punct: "", punctChanged: false, leadingQuote: "", trailingQuote: "" },
-    { text: "dogs", changed: false, reason: "", punct: "", punctChanged: false, leadingQuote: "", trailingQuote: "" }
+    { text: "My", changed: false, reason: "", punct: "", punctChanged: false },
+    { text: "sister", changed: false, reason: "", punct: "", punctChanged: false },
+    { text: "enjoys", changed: true, reason: "", punct: "", punctChanged: false },
+    { text: "cats", changed: false, reason: "", punct: ",", punctChanged: true },
+    { text: "and", changed: false, reason: "", punct: "", punctChanged: false },
+    { text: "dogs", changed: false, reason: "", punct: "", punctChanged: false }
   ]);
 });
 
@@ -317,8 +288,8 @@ test("the typed transcript leaves already-correct punctuation alone", () => {
   const punctuationByWordId = new Map([["s1", "."]]);
   const transcript = buildCorrectionTranscript([group], [], punctuationByWordId);
   assert.deepEqual(transcript, [
-    { text: "Hello", changed: false, reason: "", punct: "", punctChanged: false, leadingQuote: "", trailingQuote: "" },
-    { text: "Ahmet", changed: false, reason: "", punct: ".", punctChanged: false, leadingQuote: "", trailingQuote: "" }
+    { text: "Hello", changed: false, reason: "", punct: "", punctChanged: false },
+    { text: "Ahmet", changed: false, reason: "", punct: ".", punctChanged: false }
   ]);
 });
 
@@ -327,8 +298,8 @@ test("a punctuation-only correction colors only the mark, not the word it follow
   const punctuationByWordId = new Map([["s1", "."]]);
   const transcript = buildCorrectionTranscript([group], [], punctuationByWordId);
   assert.deepEqual(transcript, [
-    { text: "Hello", changed: false, reason: "", punct: "", punctChanged: false, leadingQuote: "", trailingQuote: "" },
-    { text: "Ahmet", changed: false, reason: "", punct: ".", punctChanged: true, leadingQuote: "", trailingQuote: "" }
+    { text: "Hello", changed: false, reason: "", punct: "", punctChanged: false },
+    { text: "Ahmet", changed: false, reason: "", punct: ".", punctChanged: true }
   ]);
 });
 
@@ -709,12 +680,12 @@ test("the typed transcript drops wrong words entirely and marks only the correct
   ];
   const transcript = buildCorrectionTranscript([group], corrections);
   assert.deepEqual(transcript, [
-    { text: "My", changed: false, reason: "", punct: "", punctChanged: false, leadingQuote: "", trailingQuote: "" },
-    { text: "brother", changed: false, reason: "", punct: "", punctChanged: false, leadingQuote: "", trailingQuote: "" },
-    { text: "enjoys", changed: true, reason: "", punct: "", punctChanged: false, leadingQuote: "", trailingQuote: "" },
-    { text: "read", changed: false, reason: "", punct: "", punctChanged: false, leadingQuote: "", trailingQuote: "" },
-    { text: "to", changed: true, reason: "", punct: "", punctChanged: false, leadingQuote: "", trailingQuote: "" },
-    { text: "books", changed: false, reason: "", punct: "", punctChanged: false, leadingQuote: "", trailingQuote: "" }
+    { text: "My", changed: false, reason: "", punct: "", punctChanged: false },
+    { text: "brother", changed: false, reason: "", punct: "", punctChanged: false },
+    { text: "enjoys", changed: true, reason: "", punct: "", punctChanged: false },
+    { text: "read", changed: false, reason: "", punct: "", punctChanged: false },
+    { text: "to", changed: true, reason: "", punct: "", punctChanged: false },
+    { text: "books", changed: false, reason: "", punct: "", punctChanged: false }
   ]);
 });
 
@@ -736,37 +707,11 @@ test("the typed transcript collapses a rewrite_line's whole phrase into one red 
   }];
   const transcript = buildCorrectionTranscript([group], corrections);
   assert.deepEqual(transcript, [
-    { text: "My", changed: false, reason: "", punct: "", punctChanged: false, leadingQuote: "", trailingQuote: "" },
-    { text: "brother", changed: false, reason: "", punct: "", punctChanged: false, leadingQuote: "", trailingQuote: "" },
-    { text: "enjoys reading", changed: true, reason: "", punct: "", punctChanged: false, leadingQuote: "", trailingQuote: "" },
-    { text: "books", changed: false, reason: "", punct: "", punctChanged: false, leadingQuote: "", trailingQuote: "" }
+    { text: "My", changed: false, reason: "", punct: "", punctChanged: false },
+    { text: "brother", changed: false, reason: "", punct: "", punctChanged: false },
+    { text: "enjoys reading", changed: true, reason: "", punct: "", punctChanged: false },
+    { text: "books", changed: false, reason: "", punct: "", punctChanged: false }
   ]);
-});
-
-test("the typed transcript preserves a quoted phrase's opening and closing marks", () => {
-  const group = sentence(["He", "said", "we'll", "be", "fine"])[0];
-  group.words[2].leadingQuote = "“";
-  group.words[4].trailingQuote = "”";
-  group.words[4].punct = ",";
-  const transcript = buildCorrectionTranscript([group], []);
-  const quoted = transcript.find((token) => token.text === "we'll");
-  const closing = transcript.find((token) => token.text === "fine");
-  assert.equal(quoted.leadingQuote, "“");
-  assert.equal(closing.trailingQuote, "”");
-  assert.equal(closing.punct, ",");
-});
-
-test("the typed transcript keeps a quote attached to a word even when that word is itself corrected", () => {
-  const group = sentence(["He", "said", "fien"])[0];
-  group.words[2].leadingQuote = "“";
-  group.words[2].trailingQuote = "”";
-  const corrections = [{ action: "replace", original: "fien", replacement: "fine", target_id: "s2", left_id: "", right_id: "" }];
-  const transcript = buildCorrectionTranscript([group], corrections);
-  const last = transcript[transcript.length - 1];
-  assert.equal(last.text, "fine");
-  assert.equal(last.changed, true);
-  assert.equal(last.leadingQuote, "“");
-  assert.equal(last.trailingQuote, "”");
 });
 
 test("mergeMisplitSentenceGroups joins two groups when the split has neither terminal punctuation nor a capital start", () => {
