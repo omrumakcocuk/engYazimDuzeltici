@@ -50,7 +50,11 @@
           <button id="transcriptPrintButton" class="button secondary" type="button">Yazdır / PDF kaydet</button>
           <button id="transcriptCloseButton" class="button secondary" type="button">Kapat</button>
         </div>
-        <div id="transcriptText" class="transcript-page"></div>
+        <div class="transcript-page">
+          <div id="transcriptText" class="transcript-body"></div>
+          <div class="transcript-notes-heading" id="transcriptNotesHeading" hidden>Neden değişti?</div>
+          <ol id="transcriptNotes" class="transcript-notes" hidden></ol>
+        </div>
       </div>
     </div>
   </main>

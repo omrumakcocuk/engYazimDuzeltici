@@ -28,6 +28,8 @@ const providers = ["gemini"].map((name) => {
 
 const transcriptOverlay = document.querySelector("#transcriptOverlay");
 const transcriptText = document.querySelector("#transcriptText");
+const transcriptNotes = document.querySelector("#transcriptNotes");
+const transcriptNotesHeading = document.querySelector("#transcriptNotesHeading");
 const transcriptPrintButton = document.querySelector("#transcriptPrintButton");
 const transcriptCloseButton = document.querySelector("#transcriptCloseButton");
 transcriptPrintButton.addEventListener("click", () => window.print());
@@ -436,11 +438,40 @@ function renderCorrectionList(engine, corrections) {
 
 function showTranscript(provider) {
   if (!provider.transcript?.length) return;
+  // Numbering only the corrections that carry an actual explanation keeps
+  // the footnote numbers dense (1, 2, 3...) instead of skipping around, and
+  // matches exactly what appears in the explanation list below the text.
+  const explained = provider.transcript.filter((token) => token.changed && token.reason);
+  const numberByToken = new Map(explained.map((token, index) => [token, index + 1]));
   transcriptText.innerHTML = provider.transcript
-    .map((token) => token.changed
-      ? `<span class="fixed">${escapeHtml(token.text)}</span>`
-      : escapeHtml(token.text))
+    .map((token) => {
+      let wordHtml;
+      if (token.changed) {
+        const number = numberByToken.get(token);
+        const marker = number ? `<sup>${number}</sup>` : "";
+        wordHtml = `<span class="fixed">${escapeHtml(token.text)}${marker}</span>`;
+      } else {
+        wordHtml = escapeHtml(token.text);
+      }
+      if (!token.punct) return wordHtml;
+      // The punctuation mark gets its own red styling independent of the
+      // word - a corrected mark must not color a word that was itself
+      // written correctly, and vice versa.
+      const punctHtml = token.punctChanged
+        ? `<span class="fixed">${escapeHtml(token.punct)}</span>`
+        : escapeHtml(token.punct);
+      return wordHtml + punctHtml;
+    })
     .join(" ");
+  transcriptNotes.innerHTML = explained.length
+    ? explained.map((token, index) => `
+      <li>
+        <span class="note-number">${index + 1}</span>
+        <span class="note-body"><strong>${escapeHtml(token.text)}</strong> — ${escapeHtml(token.reason)}</span>
+      </li>`).join("")
+    : "";
+  transcriptNotes.hidden = explained.length === 0;
+  transcriptNotesHeading.hidden = explained.length === 0;
   transcriptOverlay.hidden = false;
 }
 

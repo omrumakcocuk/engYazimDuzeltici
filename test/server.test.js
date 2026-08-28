@@ -7,6 +7,7 @@ const {
   buildSentenceGroups,
   correctionsFromGeminiEdits,
   detectAdvancedGrammar,
+  detectCapitalizationErrors,
   detectDeterministicGrammar,
   diffLineToCorrections,
   enforceParallelCorrectionForms,
@@ -16,7 +17,9 @@ const {
   groupOcrWordsIntoLines,
   isSafeCorrection,
   mergeCorrections,
+  mergeMisplitSentenceGroups,
   normalizeGeminiEdits,
+  normalizeGeminiPunctuation,
   normalizeOcrNumber,
   organizeSentenceGroupsWithGemini,
   parseGeminiJson,
@@ -128,6 +131,159 @@ test("Google Vision word polygons are normalized to the shared coordinate space"
   }]);
 });
 
+function visionWord(text, left = 0, symbols) {
+  return {
+    confidence: 0.9,
+    symbols: symbols || text.split("").map((character) => ({ text: character })),
+    boundingBox: {
+      vertices: [{ x: left, y: 0 }, { x: left + 10, y: 0 }, { x: left + 10, y: 10 }, { x: left, y: 10 }],
+      normalizedVertices: []
+    }
+  };
+}
+
+test("trailing punctuation attached to a word is captured separately from its text", () => {
+  const words = parseGoogleVisionWords({
+    fullTextAnnotation: { pages: [{ width: 100, height: 100, blocks: [{ paragraphs: [{ words: [
+      visionWord("cats,", 0),
+      visionWord("Ankara.", 20)
+    ] }] }] }] }
+  });
+  assert.equal(words[0].text, "cats");
+  assert.equal(words[0].punct, ",");
+  assert.equal(words[1].text, "Ankara");
+  assert.equal(words[1].punct, ".");
+});
+
+test("a standalone punctuation symbol attaches to its nearest word by position", () => {
+  const words = parseGoogleVisionWords({
+    fullTextAnnotation: { pages: [{ width: 100, height: 100, blocks: [{ paragraphs: [{ words: [
+      // Vision's raw array order does not match reading order here (the
+      // mark is listed second even though "Ahmet" sits further right) -
+      // position, not array order, must decide which word it attaches to.
+      visionWord("?", 30),
+      visionWord("Ahmet", 10)
+    ] }] }] }] }
+  });
+  assert.equal(words.length, 1);
+  assert.equal(words[0].text, "Ahmet");
+  assert.equal(words[0].punct, "?");
+});
+
+test("a standalone punctuation symbol on a different physical line is not attached", () => {
+  const words = parseGoogleVisionWords({
+    fullTextAnnotation: { pages: [{ width: 100, height: 100, blocks: [{ paragraphs: [{ words: [
+      visionWord("Ahmet", 10),
+      { ...visionWord(".", 10), boundingBox: {
+        vertices: [{ x: 10, y: 200 }, { x: 20, y: 200 }, { x: 20, y: 210 }, { x: 10, y: 210 }], normalizedVertices: []
+      } }
+    ] }] }] }] }
+  });
+  assert.equal(words.length, 1);
+  assert.equal(words[0].punct, undefined);
+});
+
+test("three or more dots normalize to an ellipsis mark", () => {
+  const words = parseGoogleVisionWords({
+    fullTextAnnotation: { pages: [{ width: 100, height: 100, blocks: [{ paragraphs: [{ words: [
+      visionWord("wait..."),
+    ] }] }] }] }
+  });
+  assert.equal(words[0].text, "wait");
+  assert.equal(words[0].punct, "...");
+});
+
+test("normalizeGeminiPunctuation keeps only entries with a known word id and an allowed mark", () => {
+  const group = sentence(["cats", "and", "dogs"])[0];
+  const result = normalizeGeminiPunctuation(group, [
+    { after_id: "s0", mark: "!" },
+    { after_id: "unknown-id", mark: "." },
+    { after_id: "s2", mark: ";" },
+    { after_id: "s2", mark: "." }
+  ]);
+  assert.deepEqual(result, [
+    { after_id: "s2", mark: "." }
+  ]);
+});
+
+test("normalizeGeminiPunctuation never lets a comma through, even mid-sentence", () => {
+  const group = sentence(["cats", "and", "dogs"])[0];
+  const result = normalizeGeminiPunctuation(group, [
+    { after_id: "s0", mark: "," }
+  ]);
+  assert.deepEqual(result, []);
+});
+
+test("normalizeGeminiPunctuation drops a sentence-ending mark placed mid-group even when it also proposes a comma there", () => {
+  const group = sentence(["I", "should", "pay", "more", "attention", "to", "grammar"])[0];
+  const result = normalizeGeminiPunctuation(group, [
+    { after_id: "s4", mark: "." },
+    { after_id: "s1", mark: "," },
+    { after_id: "s6", mark: "." }
+  ]);
+  assert.deepEqual(result, [
+    { after_id: "s6", mark: "." }
+  ]);
+});
+
+test("the typed transcript adds a missing comma without altering an unrelated word correction", () => {
+  const group = sentence(["My", "sister", "enjoy", "cats", "and", "dogs"])[0];
+  group.words[3].punct = "";
+  const corrections = [
+    { action: "replace", original: "enjoy", replacement: "enjoys", target_id: "s2", left_id: "", right_id: "" }
+  ];
+  const punctuationByWordId = new Map([["s3", ","]]);
+  const transcript = buildCorrectionTranscript([group], corrections, punctuationByWordId);
+  assert.deepEqual(transcript, [
+    { text: "My", changed: false, reason: "", punct: "", punctChanged: false },
+    { text: "sister", changed: false, reason: "", punct: "", punctChanged: false },
+    { text: "enjoys", changed: true, reason: "", punct: "", punctChanged: false },
+    { text: "cats", changed: false, reason: "", punct: ",", punctChanged: true },
+    { text: "and", changed: false, reason: "", punct: "", punctChanged: false },
+    { text: "dogs", changed: false, reason: "", punct: "", punctChanged: false }
+  ]);
+});
+
+test("the typed transcript leaves already-correct punctuation alone", () => {
+  const group = sentence(["Hello", "Ahmet"])[0];
+  group.words[1].punct = ".";
+  const punctuationByWordId = new Map([["s1", "."]]);
+  const transcript = buildCorrectionTranscript([group], [], punctuationByWordId);
+  assert.deepEqual(transcript, [
+    { text: "Hello", changed: false, reason: "", punct: "", punctChanged: false },
+    { text: "Ahmet", changed: false, reason: "", punct: ".", punctChanged: false }
+  ]);
+});
+
+test("a punctuation-only correction colors only the mark, not the word it follows", () => {
+  const group = sentence(["Hello", "Ahmet"])[0];
+  const punctuationByWordId = new Map([["s1", "."]]);
+  const transcript = buildCorrectionTranscript([group], [], punctuationByWordId);
+  assert.deepEqual(transcript, [
+    { text: "Hello", changed: false, reason: "", punct: "", punctChanged: false },
+    { text: "Ahmet", changed: false, reason: "", punct: ".", punctChanged: true }
+  ]);
+});
+
+test("a word's own explanation survives a punctuation change landing on the same token", () => {
+  const group = sentence(["My", "sister", "enjoy", "cats"])[0];
+  const corrections = [{
+    action: "replace", original: "enjoy", replacement: "enjoys",
+    reason: "Third-person singular subjects need an -s ending.",
+    target_id: "s2", left_id: "", right_id: ""
+  }];
+  const punctuationByWordId = new Map([["s3", "."]]);
+  const transcript = buildCorrectionTranscript([group], corrections, punctuationByWordId);
+  const last = transcript[transcript.length - 1];
+  assert.equal(last.text, "cats");
+  assert.equal(last.changed, false);
+  assert.equal(last.punct, ".");
+  assert.equal(last.punctChanged, true);
+  assert.equal(last.reason, "");
+  const enjoysToken = transcript.find((token) => token.text === "enjoys");
+  assert.equal(enjoysToken.reason, "Third-person singular subjects need an -s ending.");
+});
+
 test("Gemini uses coordinate layout before visual fallback", async () => {
   const originalFetch = global.fetch;
   const requests = [];
@@ -156,6 +312,49 @@ test("Gemini uses coordinate layout before visual fallback", async () => {
     global.fetch = originalFetch;
   }
 });
+
+test("a sentence's word order is corrected from physical-line position when Gemini swaps two word IDs", async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async (_url, options) => {
+    const request = JSON.parse(options.body);
+    const wordsRequested = request.contents[0].parts.length === 1;
+    return {
+      ok: true,
+      json: async () => ({
+        candidates: [{ content: { parts: [{ text: JSON.stringify({
+          lines: [{ word_ids: ["w1", "w2", "w3"] }, { word_ids: ["w4"] }],
+          // A real case: the last word of line 1 ("all") and the sole word
+          // wrapped onto line 2 ("day") arrive swapped in the sentence's
+          // word_id sequence, even though the lines array (above) correctly
+          // places w3 on line 1 and w4 on line 2.
+          sentences: [{ word_ids: ["w1", "w2", "w4", "w3"] }]
+        }) }] } }]
+      })
+    };
+  };
+  try {
+    const result = await organizeSentenceGroupsWithGemini(
+      "data:image/jpeg;base64,AA==",
+      [
+        word("w1", "it", 100, 100), word("w2", "rains", 180, 100), word("w3", "all", 260, 100),
+        word("w4", "day", 100, 200)
+      ]
+    );
+    assert.equal(result.groups[0].text, "it rains all day");
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+// Note: a follow-up attempt replaced Gemini's own physical-line assignment
+// with pure y-coordinate clustering here, reasoning that geometry can never
+// be wrong. In practice this repo's line clustering has no curvature/slant
+// compensation wired in (see groupOcrWordsIntoLines - the correction for
+// that exists but is disabled after an earlier, unrelated regression), so
+// on any photographed page with real-world curl or slant it misclusters
+// words into the wrong physical line far more often and far worse than
+// Gemini's own occasional line-assignment mistake. That attempt was
+// reverted; Gemini's line assignment remains the trusted source for now.
 
 test("an incomplete coordinate layout retries with the photograph", async () => {
   const originalFetch = global.fetch;
@@ -316,12 +515,12 @@ test("the typed transcript drops wrong words entirely and marks only the correct
   ];
   const transcript = buildCorrectionTranscript([group], corrections);
   assert.deepEqual(transcript, [
-    { text: "My", changed: false },
-    { text: "brother", changed: false },
-    { text: "enjoys", changed: true },
-    { text: "read", changed: false },
-    { text: "to", changed: true },
-    { text: "books", changed: false }
+    { text: "My", changed: false, reason: "", punct: "", punctChanged: false },
+    { text: "brother", changed: false, reason: "", punct: "", punctChanged: false },
+    { text: "enjoys", changed: true, reason: "", punct: "", punctChanged: false },
+    { text: "read", changed: false, reason: "", punct: "", punctChanged: false },
+    { text: "to", changed: true, reason: "", punct: "", punctChanged: false },
+    { text: "books", changed: false, reason: "", punct: "", punctChanged: false }
   ]);
 });
 
@@ -343,11 +542,34 @@ test("the typed transcript collapses a rewrite_line's whole phrase into one red 
   }];
   const transcript = buildCorrectionTranscript([group], corrections);
   assert.deepEqual(transcript, [
-    { text: "My", changed: false },
-    { text: "brother", changed: false },
-    { text: "enjoys reading", changed: true },
-    { text: "books", changed: false }
+    { text: "My", changed: false, reason: "", punct: "", punctChanged: false },
+    { text: "brother", changed: false, reason: "", punct: "", punctChanged: false },
+    { text: "enjoys reading", changed: true, reason: "", punct: "", punctChanged: false },
+    { text: "books", changed: false, reason: "", punct: "", punctChanged: false }
   ]);
+});
+
+test("mergeMisplitSentenceGroups joins two groups when the split has neither terminal punctuation nor a capital start", () => {
+  const groupA = { id: "group_1", lineIds: ["l1"], words: [word("w1", "today", 10)], text: "today" };
+  const groupB = { id: "group_2", lineIds: ["l1"], words: [word("w2", "and", 90)], text: "and" };
+  const result = mergeMisplitSentenceGroups([groupA, groupB]);
+  assert.equal(result.length, 1);
+  assert.deepEqual(result[0].words.map((w) => w.id), ["w1", "w2"]);
+  assert.equal(result[0].text, "today and");
+});
+
+test("mergeMisplitSentenceGroups keeps groups separate when the first ends with terminal punctuation", () => {
+  const groupA = { id: "group_1", lineIds: ["l1"], words: [{ ...word("w1", "today", 10), punct: "." }], text: "today" };
+  const groupB = { id: "group_2", lineIds: ["l1"], words: [word("w2", "and", 90)], text: "and" };
+  const result = mergeMisplitSentenceGroups([groupA, groupB]);
+  assert.equal(result.length, 2);
+});
+
+test("mergeMisplitSentenceGroups keeps groups separate when the next one starts with a capital letter", () => {
+  const groupA = { id: "group_1", lineIds: ["l1"], words: [word("w1", "today", 10)], text: "today" };
+  const groupB = { id: "group_2", lineIds: ["l1"], words: [word("w2", "She", 90)], text: "She" };
+  const result = mergeMisplitSentenceGroups([groupA, groupB]);
+  assert.equal(result.length, 2);
 });
 
 test("a redundant more before a comparative adjective is merged into one rewrite", () => {
@@ -633,6 +855,39 @@ test("a phrase rewrite cannot erase a protected proper name", () => {
   assert.deepEqual(filterProtectedProperNames(corrections, groups), []);
 });
 
+test("a mid-sentence function word wrongly capitalized is lowercased", () => {
+  const group = sentence(["He", "left", "even", "though", "It", "was", "raining"])[0];
+  const corrections = detectCapitalizationErrors([group]);
+  assert.deepEqual(corrections.map((item) => ({ target_id: item.target_id, replacement: item.replacement })), [
+    { target_id: "s4", replacement: "it" }
+  ]);
+  assert.ok(corrections[0].reason.includes("It"));
+});
+
+test("a capitalized proper name mid-sentence is left alone by the capitalization check", () => {
+  const group = sentence(["My", "friend", "Arda", "called", "me"])[0];
+  const corrections = detectCapitalizationErrors([group]);
+  assert.equal(corrections.length, 0);
+});
+
+test("a proper name right after a conjunction in an inverted sentence is never flagged", () => {
+  const group = sentence(["He", "went", "home", "and", "Ahmet", "stayed", "at", "school"])[0];
+  const corrections = detectCapitalizationErrors([group]);
+  assert.equal(corrections.some((item) => item.target_id === "s4"), false);
+});
+
+test("the pronoun I is never flagged by the capitalization check", () => {
+  const group = sentence(["My", "sister", "and", "I", "went", "home"])[0];
+  const corrections = detectCapitalizationErrors([group]);
+  assert.equal(corrections.length, 0);
+});
+
+test("the first word of a sentence group is never flagged by the capitalization check", () => {
+  const group = sentence(["The", "dog", "was", "happy"])[0];
+  const corrections = detectCapitalizationErrors([group]);
+  assert.equal(corrections.length, 0);
+});
+
 test("the missing verb after my name survives a curved-line grouping failure", () => {
   const words = [
     { ...word("w1", "My", 100, 110), layoutLine: "split_a" },
@@ -859,6 +1114,22 @@ test("Gemini OCR-ID edits are used only when they exactly rebuild the validated 
     replacement: "enjoys reading"
   }]);
   assert.equal(correctionsFromGeminiEdits(group, edits, "My brother enjoys books"), null);
+});
+
+test("Gemini's own reason for an edit reaches the typed transcript instead of a generic message", () => {
+  const group = sentence(["My", "sister", "like", "reading"])[0];
+  const edits = [{
+    target_ids: ["s2"],
+    left_id: "",
+    right_id: "",
+    replacement: "likes",
+    reason: "Use “likes” because “she” is a third-person singular subject."
+  }];
+  const corrections = correctionsFromGeminiEdits(group, edits, "My sister likes reading");
+  const transcript = buildCorrectionTranscript([group], corrections);
+  const changedToken = transcript.find((token) => token.changed);
+  assert.equal(changedToken.text, "likes");
+  assert.equal(changedToken.reason, "Use “likes” because “she” is a third-person singular subject.");
 });
 
 test("a single rendered rewrite cannot erase words from two physical lines", () => {

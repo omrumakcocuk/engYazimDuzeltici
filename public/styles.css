@@ -77,6 +77,23 @@ canvas { display: block; max-width: 100%; max-height: 68vh; box-shadow: 0 4px 18
   font-size: 14px; line-height: 1.9; white-space: pre-wrap;
 }
 .transcript-page .fixed { color: #c4342a; font-weight: 700; }
+.transcript-page .fixed sup { font-size: .68em; font-weight: 700; margin-left: 1px; }
+.transcript-notes-heading {
+  margin-top: 26px; padding-top: 14px; border-top: 1px solid #e1e6e3;
+  font-size: 13px; font-weight: 700; color: #66736e; text-transform: uppercase; letter-spacing: .04em;
+}
+.transcript-notes {
+  list-style: none; margin: 12px 0 0; padding: 0;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.transcript-notes li { display: flex; gap: 10px; align-items: baseline; }
+.note-number {
+  flex: 0 0 auto; width: 20px; height: 20px; border-radius: 50%;
+  background: #c4342a; color: #fff; font-size: 11px; font-weight: 700;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.note-body { font-size: 13px; line-height: 1.55; color: #2a332f; }
+.note-body strong { color: #c4342a; }
 @media print {
   body * { visibility: hidden; }
   .transcript-page, .transcript-page * { visibility: visible; }
