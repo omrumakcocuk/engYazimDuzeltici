@@ -510,7 +510,19 @@ function selectGoogleHandwrittenWords(words) {
     const lineTypicalHeight = meaningfulOnLine.map((word) => word.height).sort((a, b) => a - b)[
       Math.floor(meaningfulOnLine.length / 2)
     ];
-    return line.words.filter((word) => word.height >= lineTypicalHeight * 0.42);
+    return line.words.filter((word) => {
+      // A short word ("me", "is", "on") is naturally shorter in its OCR
+      // bounding box even when genuine - it has fewer letters and often no
+      // ascender or descender - so judging it against the same 0.42 ratio
+      // used for longer words risks discarding real short words (seen
+      // concretely: "me" measured at roughly a third of its line's
+      // typical height purely from being short, well above where an actual
+      // ink speck like "po" measures on the same scale). A shorter word
+      // gets a lower bar; only something short even by that lower bar is
+      // treated as noise.
+      const ratio = word.text.length <= 3 ? 0.28 : 0.42;
+      return word.height >= lineTypicalHeight * ratio;
+    });
   }).filter((word) => /^[A-Za-z0-9']+$/.test(word.text));
   return selectHandwrittenWords(documentWords.length >= 2 ? documentWords : words);
 }
@@ -1025,16 +1037,43 @@ function normalizeGeminiEdits(group, edits) {
   return normalized;
 }
 
+// Only trusted as a question-forming word at the very start of a sentence -
+// an auxiliary/modal inversion ("Does he...", "Can she...") or a wh-word
+// ("What...", "Where..."). Used to decide whether a "?" the model proposes
+// is actually warranted, as opposed to the model reading a plain word-order
+// error (e.g. "Enjoys he playing football") as if it were a question.
+const QUESTION_STARTER_WORDS = new Set([
+  "do", "does", "did", "is", "are", "am", "was", "were",
+  "can", "could", "will", "would", "shall", "should", "may", "might", "must",
+  "have", "has", "had",
+  "what", "where", "when", "why", "who", "whom", "whose", "which", "how"
+]);
+
 function normalizeGeminiPunctuation(group, punctuation) {
   if (!Array.isArray(punctuation)) return [];
   const wordById = new Map(group.words.map((word) => [word.id, word]));
   const ids = new Set(wordById.keys());
   const lastWordId = group.words.length ? group.words[group.words.length - 1].id : undefined;
   const sentenceEndingMarks = new Set([".", "!", "?", "..."]);
+  // A group's OWN first word (before any correction) is the only reliable
+  // signal for whether the student actually wrote a question: a real
+  // question inverts an auxiliary/modal to the front ("Does he...") or
+  // opens with a wh-word. Without this, a fronted-verb word-order error
+  // ("Enjoys he playing football") can get reinterpreted by the model as a
+  // question ("Does he enjoy...?") - and even after a different, more
+  // specific rule puts the words back into ordinary statement order, this
+  // punctuation array is a separate channel and would still carry that
+  // stale "?" forward with nothing to reconcile the two.
+  const firstWordNormalized = group.words[0]
+    ? group.words[0].text.toLowerCase().replace(/[^a-z']/g, "")
+    : "";
+  const groupAlreadyHasQuestionMark = group.words.some((word) => word.punct === "?");
+  const looksLikeAGenuineQuestion = QUESTION_STARTER_WORDS.has(firstWordNormalized) || groupAlreadyHasQuestionMark;
   const normalized = [];
   for (const entry of punctuation) {
     if (!entry || typeof entry.after_id !== "string" || typeof entry.mark !== "string") continue;
     if (!ids.has(entry.after_id) || !allowedPunctuationMarks.has(entry.mark)) continue;
+    const mark = entry.mark === "?" && !looksLikeAGenuineQuestion ? "." : entry.mark;
     // Commas are correct or missing far more often as a matter of style
     // preference than as a rule a child's sentence actually breaks without,
     // and flagging every debatable spot as an "error" buries the handful of
@@ -1044,15 +1083,15 @@ function normalizeGeminiPunctuation(group, punctuation) {
     // both ways - a comma the student already wrote correctly must not be
     // stripped out either, so an explicit removal (mark "") is rejected
     // here too when it targets a word that already carries a comma.
-    if (entry.mark === "," || (entry.mark === "" && wordById.get(entry.after_id)?.punct === ",")) continue;
+    if (mark === "," || (mark === "" && wordById.get(entry.after_id)?.punct === ",")) continue;
     // A group is exactly one logical sentence, so a sentence-ending mark can
     // only be correct at the group's own last word - anywhere else it would
     // terminate the sentence mid-clause. Gemini occasionally misplaces one
     // there (seen concretely while also rewriting a nearby word in the same
     // response); a comma or an explicit removal ("") has no such
     // restriction and is still accepted anywhere in the group.
-    if (sentenceEndingMarks.has(entry.mark) && entry.after_id !== lastWordId) continue;
-    normalized.push({ after_id: entry.after_id, mark: entry.mark });
+    if (sentenceEndingMarks.has(mark) && entry.after_id !== lastWordId) continue;
+    normalized.push({ after_id: entry.after_id, mark });
   }
   return normalized;
 }
@@ -1893,7 +1932,15 @@ function isOrdinaryLexicalVerb(word) {
     && (tags.includes("PresentTense") || tags.includes("PastTense") || tags.includes("Gerund") || tags.includes("Infinitive"));
 }
 function isAnyVerbWord(word) {
-  return getWordTags(word).includes("Verb");
+  const tags = getWordTags(word);
+  // A gerund ("playing", "reading") is a non-finite -ing form acting as the
+  // object of the verb before it ("enjoys playing football"), not a
+  // separate clause that needs its own subject - unlike a modal or a
+  // finite past-tense verb ("can rest", "had packed"), which do. The one
+  // place this function is used decides whether a pronoun is needed by the
+  // word after it; treating a gerund as "needing a subject" there inserted
+  // a bogus extra pronoun before an ordinary gerund object.
+  return tags.includes("Verb") && !tags.includes("Gerund");
 }
 
 function frontedVerbPronounCorrections(tokens, index, sentenceStartIds) {
@@ -1924,7 +1971,8 @@ function frontedVerbPronounCorrections(tokens, index, sentenceStartIds) {
   // leave the following verb without a subject ("he wishes had more
   // time"). Supplying a new subject via insert, rather than relocating the
   // existing pronoun, keeps both verbs correctly supplied.
-  if (nextWord && isAnyVerbWord(nextNormalized) && index > 0) {
+  const pronounNeededByFollowingVerb = nextWord && isAnyVerbWord(nextNormalized);
+  if (pronounNeededByFollowingVerb && index > 0) {
     const corrections = [makeInsert(
       tokens[index - 1], verbWord, pronounWord.text.toLowerCase(),
       "Add the missing subject before the verb."
@@ -1952,14 +2000,31 @@ function frontedVerbPronounCorrections(tokens, index, sentenceStartIds) {
   // itself), the whole reorder is skipped instead of only half-applying and
   // leaving a broken result (the verb's new tense stranded with no subject,
   // or the subject duplicated).
-  return [{
+  const swapCorrection = {
     action: "rewrite_line",
     original: `${verbWord.text} ${pronounWord.text}`,
     replacement: `${subject} ${verbWord.text.toLowerCase()}`,
     reason: "In English statements, the subject comes before the verb (word order).",
     target_ids: [verbWord.id, pronounWord.id],
     target_id: "", left_id: "", right_id: ""
-  }];
+  };
+  if (!pronounNeededByFollowingVerb) return [swapCorrection];
+  // The verb is the fronted word's own sentence-initial position (index 0),
+  // so there is no earlier word in the group to anchor an "insert a new
+  // subject before the verb" fix against, unlike the branch above. The fix
+  // instead keeps the ordinary swap (which alone already fixes the fronted
+  // verb) and separately inserts a fresh subject for the verb that
+  // follows, anchored on the pronoun's own word id - the insert is
+  // returned first so it is evaluated before the swap claims that id (an
+  // insert anchored on an id a later item in the same array also claims is
+  // otherwise dropped as a stale conflict, which is right when the two
+  // corrections come from different sources but wrong here, since both
+  // pieces are part of one correction).
+  const insertCorrection = makeInsert(
+    pronounWord, nextWord, pronounWord.text.toLowerCase(),
+    "Add the missing subject before the verb."
+  );
+  return [insertCorrection, swapCorrection];
 }
 
 function detectDeterministicGrammar(words, sentenceGroups = [], punctuationByWordId = new Map()) {
@@ -2043,10 +2108,24 @@ function detectDeterministicGrammar(words, sentenceGroups = [], punctuationByWor
     const tokens = [...line.words].sort((a, b) => a.x - b.x);
     const normalized = tokens.map((word) => word.text.toLowerCase().replace(/[^a-z0-9']/g, ""));
 
-    for (let index = 0; index <= tokens.length - 3; index += 1) {
-      if (!isFrontableLexicalVerb(normalized[index]) || !subjectPronouns.has(normalized[index + 1])) continue;
-      if (!wordsShareSentence(tokens[index], tokens[index + 1])) continue;
-      frontedVerbCorrections.push(...frontedVerbPronounCorrections(tokens, index, sentenceStartIds));
+    // Skipped whenever real sentence-group data is available: the group
+    // loop further down is the authoritative source for this exact pattern
+    // once sentence boundaries are known (see wordsShareSentence above),
+    // and physical-line position is not a safe substitute for it - a
+    // sentence can legitimately start mid-line ("...the park. Enjoys he
+    // playing...", where "Enjoys" is not the line's first word but is its
+    // sentence's first word), and the two loops disagreeing about whether
+    // this word is "sentence-initial" produced contradictory corrections
+    // that both survived (an inserted subject, and a stale capitalization
+    // fix, alongside the group loop's own correct reorder never firing
+    // because its target was already claimed by the wrong-context fix).
+    // Only when there is no group data at all (a caller that never passes
+    // sentenceGroups) does this line-based pass still run, as a fallback.
+    if (!groupIdByWordId.size) {
+      for (let index = 0; index <= tokens.length - 3; index += 1) {
+        if (!isFrontableLexicalVerb(normalized[index]) || !subjectPronouns.has(normalized[index + 1])) continue;
+        frontedVerbCorrections.push(...frontedVerbPronounCorrections(tokens, index, sentenceStartIds));
+      }
     }
 
     // The same fronted-verb mistake also happens with a short noun-phrase

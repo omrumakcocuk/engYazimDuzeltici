@@ -228,6 +228,25 @@ test("normalizeGeminiPunctuation drops a sentence-ending mark placed mid-group e
   ]);
 });
 
+test("a question mark is downgraded to a period when the sentence does not actually start with a question word", () => {
+  const group = sentence(["Enjoys", "he", "playing", "football"])[0];
+  const result = normalizeGeminiPunctuation(group, [{ after_id: "s3", mark: "?" }]);
+  assert.deepEqual(result, [{ after_id: "s3", mark: "." }]);
+});
+
+test("a question mark is kept when the sentence genuinely opens with an auxiliary", () => {
+  const group = sentence(["Does", "he", "like", "football"])[0];
+  const result = normalizeGeminiPunctuation(group, [{ after_id: "s3", mark: "?" }]);
+  assert.deepEqual(result, [{ after_id: "s3", mark: "?" }]);
+});
+
+test("a question mark is kept when the student already wrote one, even if the sentence does not open with a question word", () => {
+  const group = sentence(["He", "like", "football"])[0];
+  group.words[2].punct = "?";
+  const result = normalizeGeminiPunctuation(group, [{ after_id: "s2", mark: "?" }]);
+  assert.deepEqual(result, [{ after_id: "s2", mark: "?" }]);
+});
+
 test("a missing apostrophe in a contraction is never flagged, for any contraction", () => {
   assert.equal(isApostropheOnlyFix("cant", "can't"), true);
   assert.equal(isApostropheOnlyFix("dont", "don't"), true);
@@ -487,6 +506,21 @@ test("a stray punctuation mark misread as a tiny word on a real handwriting line
   );
 });
 
+test("a genuinely short word on the same line as taller ones is kept, not mistaken for a stray ink speck", () => {
+  const words = [
+    { id: "w1", text: "yesterday", x: 10, y: 400, width: 150, height: 36 },
+    { id: "w2", text: "my", x: 170, y: 400, width: 50, height: 31 },
+    { id: "w3", text: "friend", x: 230, y: 400, width: 100, height: 34 },
+    { id: "w4", text: "and", x: 340, y: 400, width: 60, height: 31 },
+    { id: "w5", text: "me", x: 410, y: 410, width: 45, height: 12 },
+    { id: "w6", text: "went", x: 465, y: 405, width: 45, height: 20 }
+  ];
+  assert.deepEqual(
+    selectGoogleHandwrittenWords(words).map((item) => item.id),
+    ["w1", "w2", "w3", "w4", "w5", "w6"]
+  );
+});
+
 test("a device's own status bar text photographed above a full page of real handwriting is dropped", () => {
   const words = [
     { id: "s1", text: "Agu", x: 85, y: 0, width: 34, height: 9 },
@@ -627,6 +661,29 @@ test("a fronted verb whose pronoun is needed by a following verb gets a new subj
   const corrections = detectDeterministicGrammar(words);
   assert.deepEqual(corrections, [
     { action: "insert", original: "", replacement: "he", reason: "Add the missing subject before the verb.", target_id: "", left_id: "w1", right_id: "w2" }
+  ]);
+});
+
+test("a fronted verb at its group's own first word still keeps the pronoun a following verb needs, via a swap plus a separate insert", () => {
+  const words = [
+    word("w1", "Hopes", 10), word("w2", "he", 90), word("w3", "can", 170), word("w4", "rest", 240)
+  ];
+  const group = { id: "g1", words };
+  const corrections = mergeCorrections(detectDeterministicGrammar(words, [group]));
+  assert.deepEqual(corrections, [
+    { action: "insert", original: "", replacement: "he", reason: "Add the missing subject before the verb.", target_id: "", left_id: "w2", right_id: "w3" },
+    { action: "rewrite_line", original: "Hopes he", replacement: "He hopes", reason: "In English statements, the subject comes before the verb (word order).", target_ids: ["w1", "w2"], target_id: "", left_id: "", right_id: "" }
+  ]);
+});
+
+test("a gerund right after the pronoun is its object, not a clause needing a new subject, so no extra pronoun is inserted", () => {
+  const words = [
+    word("w1", "Enjoys", 10), word("w2", "he", 90), word("w3", "playing", 170), word("w4", "football", 240)
+  ];
+  const group = { id: "g1", words };
+  const corrections = mergeCorrections(detectDeterministicGrammar(words, [group]));
+  assert.deepEqual(corrections, [
+    { action: "rewrite_line", original: "Enjoys he", replacement: "He enjoys", reason: "In English statements, the subject comes before the verb (word order).", target_ids: ["w1", "w2"], target_id: "", left_id: "", right_id: "" }
   ]);
 });
 
