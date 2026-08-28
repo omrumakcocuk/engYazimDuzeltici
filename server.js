@@ -179,7 +179,7 @@ async function correctLetter(req, res) {
     );
 
     const grammaticallyAligned = enforceParallelCorrectionForms(corrections, sentenceGroups);
-    const deterministicCorrections = detectDeterministicGrammar(words, sentenceGroups);
+    const deterministicCorrections = detectDeterministicGrammar(words, sentenceGroups, punctuationByWordId);
     const advancedCorrections = detectAdvancedGrammar(sentenceGroups);
     const capitalizationCorrections = detectCapitalizationErrors(sentenceGroups);
     const finalCorrections = mergeCorrections(
@@ -1887,12 +1887,38 @@ function frontedVerbPronounCorrections(tokens, index, sentenceStartIds) {
   }];
 }
 
-function detectDeterministicGrammar(words, sentenceGroups = []) {
+function detectDeterministicGrammar(words, sentenceGroups = [], punctuationByWordId = new Map()) {
   const possessives = new Set(["my", "your", "his", "her", "our", "their"]);
   const linkingVerbs = new Set(["am", "is", "are", "was", "were"]);
   const corrections = [];
   const frontedVerbCorrections = [];
-  const sentenceStartIds = new Set(sentenceGroups.map((group) => group.words?.[0]?.id).filter(Boolean));
+  // A group's first word only counts as a trustworthy "real sentence start"
+  // when there is strong evidence for it: either it is the very first
+  // sentence in the letter, or the sentence before it actually ends with
+  // terminal punctuation. Relying on the group boundary alone is not
+  // enough - Gemini's own sentence split can be wrong (invisibly so when
+  // it happens to land right where a capitalized OCR line-wrap artifact
+  // already looks like a new sentence), and defaulting to lowercase in
+  // that uncertain case is the safe direction: a wrongly-lowercase subject
+  // is a minor style slip, while a wrongly-capitalized one reads as a
+  // second, unintended sentence.
+  const sentenceEndingMarksForStart = new Set([".", "!", "?", "..."]);
+  const sentenceStartIds = new Set();
+  sentenceGroups.forEach((group, groupIndex) => {
+    const firstWord = group.words?.[0];
+    if (!firstWord) return;
+    const previousGroup = sentenceGroups[groupIndex - 1];
+    const previousLastWord = previousGroup?.words?.[previousGroup.words.length - 1];
+    // A period the model added via its punctuation array (not present in
+    // the raw OCR text) is just as reliable a boundary as one OCR captured
+    // directly, so it counts here too.
+    const previousEffectivePunct = previousLastWord
+      ? (punctuationByWordId.get(previousLastWord.id) ?? previousLastWord.punct)
+      : "";
+    const hasReliableBoundary = groupIndex === 0
+      || sentenceEndingMarksForStart.has(previousEffectivePunct);
+    if (hasReliableBoundary) sentenceStartIds.add(firstWord.id);
+  });
   const subjectPronouns = new Set(["he", "she", "it", "we", "they", "you", "i"]);
 
   // Geometry fallback for introductions. It does not depend on sentence

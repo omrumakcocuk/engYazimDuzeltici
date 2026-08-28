@@ -767,7 +767,7 @@ test("a fronted lexical verb followed by an object noun phrase is left alone", (
   );
 });
 
-test("a word-order error is found after another clause on the same physical line", () => {
+test("a word-order error is found after another clause on the same physical line, but stays lowercase without a real period backing the split", () => {
   const words = [
     word("w1", "they", 10), word("w2", "study", 80), word("w3", "hard", 150),
     word("w4", "Likes", 230), word("w5", "he", 310), word("w6", "football", 370)
@@ -779,8 +779,42 @@ test("a word-order error is found after another clause on the same physical line
   const corrections = detectDeterministicGrammar(words, groups);
   const rewrite = corrections.find((item) => item.action === "rewrite_line");
   assert.deepEqual(rewrite.target_ids, ["w4", "w5"]);
-  assert.equal(rewrite.replacement, "He likes");
+  // The group split here has no real terminal punctuation backing it (just
+  // a capitalized OCR reading, which is exactly the ambiguous signal that
+  // can also be a line-wrap artifact), so the safe default is lowercase.
+  assert.equal(rewrite.replacement, "he likes");
   assert.equal(corrections.some((item) => (item.target_ids || []).includes("w6")), false);
+});
+
+test("the same split capitalizes the subject once the prior sentence actually ends with a period", () => {
+  const words = [
+    { ...word("w1", "they", 10), punct: "" }, word("w2", "study", 80), { ...word("w3", "hard", 150), punct: "." },
+    word("w4", "Likes", 230), word("w5", "he", 310), word("w6", "football", 370)
+  ];
+  const groups = [
+    { id: "g1", words: words.slice(0, 3) },
+    { id: "g2", words: words.slice(3) }
+  ];
+  const corrections = detectDeterministicGrammar(words, groups);
+  const rewrite = corrections.find((item) => item.action === "rewrite_line");
+  assert.deepEqual(rewrite.target_ids, ["w4", "w5"]);
+  assert.equal(rewrite.replacement, "He likes");
+});
+
+test("a period added by the model's own punctuation correction also counts as a reliable sentence boundary", () => {
+  const words = [
+    word("w1", "they", 10), word("w2", "study", 80), word("w3", "hard", 150),
+    word("w4", "Likes", 230), word("w5", "he", 310), word("w6", "football", 370)
+  ];
+  const groups = [
+    { id: "g1", words: words.slice(0, 3) },
+    { id: "g2", words: words.slice(3) }
+  ];
+  const punctuationByWordId = new Map([["w3", "."]]);
+  const corrections = detectDeterministicGrammar(words, groups, punctuationByWordId);
+  const rewrite = corrections.find((item) => item.action === "rewrite_line");
+  assert.deepEqual(rewrite.target_ids, ["w4", "w5"]);
+  assert.equal(rewrite.replacement, "He likes");
 });
 
 test("a past marker tolerates one-character OCR noise in an irregular verb", () => {
