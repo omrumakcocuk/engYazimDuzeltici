@@ -12,6 +12,8 @@ const {
   diffLineToCorrections,
   enforceParallelCorrectionForms,
   filterLikelyOcrArtifacts,
+  filterApostropheOnlyFixes,
+  isApostropheOnlyFix,
   filterProtectedProperNames,
   filterUnrenderableCorrections,
   groupOcrWordsIntoLines,
@@ -224,6 +226,28 @@ test("normalizeGeminiPunctuation drops a sentence-ending mark placed mid-group e
   assert.deepEqual(result, [
     { after_id: "s6", mark: "." }
   ]);
+});
+
+test("a missing apostrophe in a contraction is never flagged, for any contraction", () => {
+  assert.equal(isApostropheOnlyFix("cant", "can't"), true);
+  assert.equal(isApostropheOnlyFix("dont", "don't"), true);
+  assert.equal(isApostropheOnlyFix("im", "I'm"), true);
+  assert.equal(isApostropheOnlyFix("isnt", "isn't"), true);
+  assert.equal(isApostropheOnlyFix("wasnt", "wasn't"), true);
+  // A real word-content change must still pass through untouched.
+  assert.equal(isApostropheOnlyFix("dont", "doesn't"), false);
+  assert.equal(isApostropheOnlyFix("cant", "wait"), false);
+});
+
+test("filterApostropheOnlyFixes drops only the pure apostrophe corrections from a mixed list", () => {
+  const corrections = [
+    { action: "replace", original: "cant", replacement: "can't", target_id: "w1", left_id: "", right_id: "" },
+    { action: "replace", original: "fierd", replacement: "tired", target_id: "w2", left_id: "", right_id: "" }
+  ];
+  assert.deepEqual(
+    filterApostropheOnlyFixes(corrections).map((item) => item.target_id),
+    ["w2"]
+  );
 });
 
 test("normalizeGeminiPunctuation refuses to remove a comma the student already wrote correctly", () => {

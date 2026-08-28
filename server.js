@@ -192,7 +192,7 @@ async function correctLetter(req, res) {
       advancedCorrections,
       deterministicCorrections,
       filterProtectedProperNames(
-        filterLikelyOcrArtifacts(grammaticallyAligned),
+        filterApostropheOnlyFixes(filterLikelyOcrArtifacts(grammaticallyAligned)),
         sentenceGroups
       ),
       // Capitalization fixes only ever touch a word's case, never its
@@ -1121,6 +1121,28 @@ function filterLikelyOcrArtifacts(corrections) {
     const distance = ocrAwareWordDistance(original, replacement);
     const allowedDistance = Math.max(1, Math.floor(Math.max(original.length, replacement.length) * .4));
     return distance <= allowedDistance;
+  });
+}
+
+// Whether to correct a missing apostrophe in a contraction ("dont" ->
+// "don't", "im" -> "I'm") is a style call, not a real grammar error, and
+// this app's owner does not want it flagged for any contraction - general
+// on purpose: comparing the letters alone (ignoring case and the
+// apostrophe itself) catches every contraction uniformly instead of
+// hardcoding a word list that would need updating for each new one.
+function isApostropheOnlyFix(original, replacement) {
+  const strip = (value) => String(value || "").toLowerCase().replace(/[^a-z]/g, "");
+  const originalLetters = strip(original);
+  const replacementLetters = strip(replacement);
+  if (!originalLetters || originalLetters !== replacementLetters) return false;
+  return replacement.includes("'") && !original.includes("'");
+}
+
+function filterApostropheOnlyFixes(corrections) {
+  return corrections.filter((item) => {
+    if (item.action === "replace") return !isApostropheOnlyFix(item.original, item.replacement);
+    if (item.action === "rewrite_line") return !isApostropheOnlyFix(item.original, item.replacement);
+    return true;
   });
 }
 
@@ -2944,6 +2966,8 @@ module.exports = {
   diffLineToCorrections,
   enforceParallelCorrectionForms,
   filterLikelyOcrArtifacts,
+  filterApostropheOnlyFixes,
+  isApostropheOnlyFix,
   filterProtectedProperNames,
   filterUnrenderableCorrections,
   groupOcrWordsIntoLines,
