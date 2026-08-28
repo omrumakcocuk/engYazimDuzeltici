@@ -14,6 +14,8 @@ const {
   filterLikelyOcrArtifacts,
   filterApostropheOnlyFixes,
   isApostropheOnlyFix,
+  sanitizeCorrectionCapitalization,
+  sanitizeModelCapitalization,
   filterProtectedProperNames,
   filterUnrenderableCorrections,
   groupOcrWordsIntoLines,
@@ -727,6 +729,32 @@ test("a noun-verb-ambiguous word ending one sentence is never paired with the pr
   const corrections = detectDeterministicGrammar(words, groups);
   assert.equal(corrections.some((item) => (item.target_ids || []).includes("w3")), false);
   assert.equal(corrections.some((item) => item.left_id === "w2" && item.right_id === "w3"), false);
+});
+
+test("a model rewrite's stray mid-clause capital letter is lowered unless the word is a real name or place", () => {
+  assert.equal(sanitizeModelCapitalization("I needed Some foods"), "I needed some foods");
+  assert.equal(sanitizeModelCapitalization("He hopes he can rest"), "He hopes he can rest");
+  assert.equal(sanitizeModelCapitalization("I went to London last year"), "I went to London last year");
+  assert.equal(sanitizeModelCapitalization("My friend is Ahmet"), "My friend is Ahmet");
+});
+
+test("sanitizeCorrectionCapitalization only touches replace/rewrite_line replacement text", () => {
+  const corrections = [
+    { action: "rewrite_line", original: "some foods I needed", replacement: "I needed Some foods", target_ids: ["a", "b", "c", "d"], reason: "", target_id: "", left_id: "", right_id: "" },
+    { action: "insert", original: "", replacement: "he", reason: "", target_id: "", left_id: "x", right_id: "y" }
+  ];
+  assert.deepEqual(sanitizeCorrectionCapitalization(corrections), [
+    { ...corrections[0], replacement: "I needed some foods" },
+    corrections[1]
+  ]);
+});
+
+test("a determiner right before a noun-verb-ambiguous word means it is a noun, not a fronted verb missing a subject", () => {
+  const words = ["to", "the", "market", "I", "was", "going"]
+    .map((text, index) => word(`w${index}`, text, index * 80));
+  const group = { id: "g1", words };
+  const corrections = detectDeterministicGrammar(words, [group]);
+  assert.deepEqual(corrections, []);
 });
 
 test("the typed transcript drops wrong words entirely and marks only the correction red", () => {

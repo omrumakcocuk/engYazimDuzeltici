@@ -190,7 +190,7 @@ async function correctLetter(req, res) {
       advancedCorrections,
       deterministicCorrections,
       filterProtectedProperNames(
-        filterApostropheOnlyFixes(filterLikelyOcrArtifacts(grammaticallyAligned)),
+        sanitizeCorrectionCapitalization(filterApostropheOnlyFixes(filterLikelyOcrArtifacts(grammaticallyAligned))),
         sentenceGroups
       ),
       // Capitalization fixes only ever touch a word's case, never its
@@ -1183,6 +1183,37 @@ function filterApostropheOnlyFixes(corrections) {
   });
 }
 
+// The model occasionally capitalizes a word in the middle of its own
+// rewritten text that has no reason to be capitalized (a clause-boundary
+// quirk, e.g. rewriting "because some foods I needed" into "because I
+// needed Some foods" with a stray capital S) - a mistake this app's own
+// deterministic capitalization pass never sees, since that pass only looks
+// at the original OCR words, not text a correction invents. General on
+// purpose: lowers any non-first word of a replacement that is capitalized
+// but is not "I" and is not a real name or place (checked the same way as
+// everywhere else this session), rather than special-casing one word.
+function sanitizeModelCapitalization(replacement) {
+  return replacement.split(" ").map((token, index) => {
+    if (index === 0) return token;
+    const plain = token.replace(/[^A-Za-z']/g, "");
+    if (!/^[A-Z][a-z']*$/.test(plain)) return token;
+    const lower = plain.toLowerCase();
+    if (lower === "i") return token;
+    const tags = getWordTags(lower);
+    if (tags.includes("FirstName") || tags.includes("Place") || tags.includes("Person") || tags.includes("ProperNoun")) return token;
+    return token.charAt(0).toLowerCase() + token.slice(1);
+  }).join(" ");
+}
+
+function sanitizeCorrectionCapitalization(corrections) {
+  return corrections.map((item) => {
+    if (item.action !== "replace" && item.action !== "rewrite_line") return item;
+    if (!item.replacement || !item.replacement.includes(" ")) return item;
+    const replacement = sanitizeModelCapitalization(item.replacement);
+    return replacement === item.replacement ? item : { ...item, replacement };
+  });
+}
+
 function ocrAwareWordDistance(left, right) {
   const rows = left.length + 1;
   const cols = right.length + 1;
@@ -1946,8 +1977,14 @@ function frontedVerbPronounCorrections(tokens, index, sentenceStartIds) {
     // is the same situation in disguise: "I can't wait, but don't think we
     // have packed" - "think" already has its subject established (elided,
     // via "don't"), so the trailing "we" belongs to the embedded clause
-    // "we have packed", not to "think".
-    if (previousTags.includes("Noun") || previousTags.includes("Pronoun") || AUXILIARY_OR_COPULA_VERBS.has(previousNormalized)) return [];
+    // "we have packed", not to "think". A determiner right before it is a
+    // different tell for the same mistake: many words are noun/verb
+    // homographs the tagger reads as a verb by default when judged alone
+    // ("market", "play", "walk"), but "the market I was going" is a
+    // determiner introducing a noun phrase, not a fronted verb - "I" is
+    // already the subject of "was going" a few words later.
+    if (previousTags.includes("Noun") || previousTags.includes("Pronoun")
+      || previousTags.includes("Determiner") || AUXILIARY_OR_COPULA_VERBS.has(previousNormalized)) return [];
   }
   const nextWord = tokens[index + 2];
   const nextNormalized = nextWord ? nextWord.text.toLowerCase().replace(/[^a-z0-9']/g, "") : "";
@@ -3077,6 +3114,8 @@ module.exports = {
   filterLikelyOcrArtifacts,
   filterApostropheOnlyFixes,
   isApostropheOnlyFix,
+  sanitizeCorrectionCapitalization,
+  sanitizeModelCapitalization,
   filterProtectedProperNames,
   filterUnrenderableCorrections,
   groupOcrWordsIntoLines,
