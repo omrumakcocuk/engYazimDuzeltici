@@ -15,8 +15,6 @@ loadEnv(path.join(__dirname, ".env"));
 const PORT = Number(process.env.PORT || 3000);
 const PUBLIC_DIR = path.join(__dirname, "public");
 const MAX_BODY_SIZE = 16 * 1024 * 1024;
-const OCR_SOURCE = path.join(__dirname, "ocr.m");
-const OCR_BINARY = path.join(os.tmpdir(), "mektup-vision-ocr");
 const LANGUAGE_TOOL_URL = "http://127.0.0.1:8081/v2/check";
 const LANGUAGE_TOOL_BIN = "/opt/homebrew/opt/languagetool/bin/languagetool-server";
 const LANGUAGE_TOOL_CONFIG = "/opt/homebrew/etc/languagetool/server.properties";
@@ -1841,18 +1839,6 @@ function estimateLineWarp(words) {
   return best;
 }
 
-function formatOcrLines(words) {
-  return groupOcrWordsIntoLines(words)
-    .map((line, index) => {
-      const tokens = line.words
-        .sort((a, b) => a.x - b.x)
-        .map((word) => `[${word.id}] ${word.text}`)
-        .join(" ");
-      return `LINE ${index + 1}: ${tokens}`;
-    })
-    .join("\n");
-}
-
 // Simple-past forms whose participle is a different word (went/gone,
 // saw/seen, did/done...). Verbs where the past-simple and past-participle
 // are identical (made, bought, had, sat...) are deliberately left out: for
@@ -3026,38 +3012,6 @@ function attachOcrAnchors(corrections, words) {
   }).filter((correction) => correction.anchors.length > 0);
 }
 
-async function recognizeWords(dataUrl) {
-  const match = dataUrl.match(/^data:image\/(jpeg|png|webp);base64,(.+)$/s);
-  if (!match) throw new Error("Invalid image data.");
-  const extension = match[1] === "jpeg" ? "jpg" : match[1];
-  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "mektup-ocr-"));
-  const imagePath = path.join(tempDir, `input.${extension}`);
-  try {
-    await ensureOcrBinary();
-    await fs.promises.writeFile(imagePath, Buffer.from(match[2], "base64"));
-    const { stdout } = await execFileAsync(OCR_BINARY, [imagePath], {
-      maxBuffer: 4 * 1024 * 1024,
-      timeout: 60000
-    });
-    return JSON.parse(stdout);
-  } finally {
-    await fs.promises.rm(tempDir, { recursive: true, force: true });
-  }
-}
-
-async function ensureOcrBinary() {
-  const [sourceStat, binaryStat] = await Promise.all([
-    fs.promises.stat(OCR_SOURCE),
-    fs.promises.stat(OCR_BINARY).catch(() => null)
-  ]);
-  if (binaryStat && binaryStat.mtimeMs >= sourceStat.mtimeMs) return;
-  await execFileAsync("/usr/bin/clang", [
-    "-fobjc-arc", "-fblocks", OCR_SOURCE,
-    "-framework", "Foundation", "-framework", "AppKit", "-framework", "Vision",
-    "-o", OCR_BINARY
-  ], { timeout: 60000 });
-}
-
 function serveStatic(req, res) {
   const requestPath = req.url === "/" ? "/index.html" : req.url.split("?")[0];
   const filePath = path.resolve(PUBLIC_DIR, `.${decodeURIComponent(requestPath)}`);
@@ -3135,7 +3089,6 @@ module.exports = {
   normalizeGeminiEdits,
   normalizeGeminiPunctuation,
   parseGeminiJson,
-  recognizeWords,
   recognizeGoogleWords,
   parseGoogleVisionWords,
   selectGoogleHandwrittenWords,
