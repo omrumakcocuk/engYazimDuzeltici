@@ -1504,6 +1504,22 @@ test("a model phrase rewrite cannot overwrite a higher-priority anchored correct
   assert.deepEqual(mergeCorrections([deterministic], [model]), [deterministic]);
 });
 
+test("a bundled model rewrite is shrunk to its still-unclaimed word instead of being fully rejected, when the claimed edge is a compatible fix", () => {
+  const deterministic = { action: "replace", original: "have", replacement: "has", target_id: "w46", left_id: "", right_id: "" };
+  const model = {
+    action: "rewrite_line",
+    original: "have alot",
+    replacement: "has a lot",
+    reason: "Replace the grammatical phrase with “has a lot”.",
+    target_ids: ["w46", "w47"],
+    target_id: "", left_id: "", right_id: ""
+  };
+  assert.deepEqual(mergeCorrections([deterministic], [model]), [
+    deterministic,
+    { action: "replace", original: "alot", replacement: "a lot", reason: "Replace the grammatical phrase with “has a lot”.", target_id: "w47", left_id: "", right_id: "" }
+  ]);
+});
+
 test("a model insert anchored beside a word a higher-priority correction already rewrote is dropped", () => {
   const deterministic = { action: "replace", original: "he", replacement: "feels", target_id: "w3", left_id: "", right_id: "" };
   const model = { action: "insert", original: "", replacement: "is", target_id: "", left_id: "w3", right_id: "w4" };

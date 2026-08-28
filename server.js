@@ -2848,13 +2848,78 @@ function pluralizeCountNoun(noun) {
   return `${noun}s`;
 }
 
+// A rewrite_line that bundles several original words into one block (a
+// diff-based fallback especially tends to bundle an ordinary adjacent word
+// together with one that needs a phrase-level fix, e.g. "have alot" -> "has
+// a lot") can partially overlap a word a higher-priority correction already
+// claimed. Rejecting the whole block would also throw away its fix for the
+// still-unclaimed word(s), even when the overlap is only because two
+// independent sources happened to propose the very same fix for the shared
+// word. When the claimed word sits at either edge of the block and that
+// word's own already-applied replacement is a clean prefix/suffix of this
+// block's replacement text, this strips just that edge (word and matching
+// text) and keeps the rest - otherwise the block is left untouched, so the
+// existing all-or-nothing rejection below still applies as before.
+function shrinkRewriteAroundClaims(item, claimedIds, replacementTextById) {
+  if (item.action !== "rewrite_line") return item;
+  let ids = item.target_ids || [];
+  let originalTokens = tokenize(item.original);
+  let replacementText = item.replacement;
+  if (originalTokens.length !== ids.length || !ids.length) return item;
+  let changed = false;
+  while (ids.length && claimedIds.has(ids[0])) {
+    const claimedReplacement = replacementTextById.get(ids[0]);
+    if (typeof claimedReplacement !== "string") break;
+    const prefix = `${claimedReplacement} `;
+    if (replacementText.toLowerCase().startsWith(prefix.toLowerCase())) {
+      replacementText = replacementText.slice(prefix.length);
+    } else if (replacementText.toLowerCase() === claimedReplacement.toLowerCase()) {
+      replacementText = "";
+    } else break;
+    ids = ids.slice(1);
+    originalTokens = originalTokens.slice(1);
+    changed = true;
+  }
+  while (ids.length && claimedIds.has(ids[ids.length - 1])) {
+    const claimedReplacement = replacementTextById.get(ids[ids.length - 1]);
+    if (typeof claimedReplacement !== "string") break;
+    const suffix = ` ${claimedReplacement}`;
+    if (!replacementText.toLowerCase().endsWith(suffix.toLowerCase())) break;
+    replacementText = replacementText.slice(0, replacementText.length - suffix.length);
+    ids = ids.slice(0, -1);
+    originalTokens = originalTokens.slice(0, -1);
+    changed = true;
+  }
+  if (!changed) return item;
+  if (!ids.length || !replacementText.trim()) return { ...item, target_ids: [] };
+  // What is left after stripping the claimed edge(s) can turn out to be an
+  // unchanged carrier word rather than a genuine remaining fix (e.g. "had
+  // knew" -> "had known" is really just one word changing; once "known" is
+  // stripped as already claimed, "had" -> "had" is not a correction at all).
+  if (originalTokens.join(" ").toLowerCase() === replacementText.trim().toLowerCase()) {
+    return { ...item, target_ids: [] };
+  }
+  if (ids.length === 1) {
+    return {
+      action: "replace", original: originalTokens[0], replacement: replacementText.trim(),
+      reason: item.reason, target_id: ids[0], left_id: "", right_id: ""
+    };
+  }
+  return { ...item, target_ids: ids, original: originalTokens.join(" "), replacement: replacementText.trim() };
+}
+
 function mergeCorrections(...groups) {
   const merged = [];
   const seen = new Set();
   const claimedIds = new Set();
-  for (const item of groups.flat()) {
+  const replacementTextById = new Map();
+  for (let item of groups.flat()) {
     if (item.action === "replace" && claimedIds.has(item.target_id)) continue;
-    if (item.action === "rewrite_line" && (item.target_ids || []).some((id) => claimedIds.has(id))) continue;
+    if (item.action === "rewrite_line") {
+      item = shrinkRewriteAroundClaims(item, claimedIds, replacementTextById);
+      const ids = item.action === "rewrite_line" ? (item.target_ids || []) : [item.target_id];
+      if (!ids.length || ids.some((id) => claimedIds.has(id))) continue;
+    }
     // An insert anchored right next to a word a higher-priority correction
     // already rewrote is built on a now-stale picture of that neighboring
     // text (a lower-priority source proposed it without knowing the word
@@ -2870,7 +2935,10 @@ function mergeCorrections(...groups) {
     if (seen.has(key)) continue;
     seen.add(key);
     merged.push(item);
-    if (item.action === "replace") claimedIds.add(item.target_id);
+    if (item.action === "replace") {
+      claimedIds.add(item.target_id);
+      replacementTextById.set(item.target_id, item.replacement);
+    }
     if (item.action === "rewrite_line") {
       for (const id of item.target_ids) claimedIds.add(id);
     }
