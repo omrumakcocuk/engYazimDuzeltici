@@ -433,6 +433,22 @@ test("Google OCR ignores keyboard rows before selecting handwriting", () => {
   );
 });
 
+test("a stray punctuation mark misread as a tiny word on a real handwriting line is dropped", () => {
+  const words = [
+    { id: "w1", text: "my", x: 10, y: 400, width: 60, height: 26 },
+    { id: "w2", text: "friend", x: 90, y: 400, width: 80, height: 26 },
+    { id: "w3", text: "po", x: 200, y: 405, width: 12, height: 4 },
+    { id: "w4", text: "called", x: 250, y: 400, width: 80, height: 26 },
+    { id: "w5", text: "she", x: 10, y: 470, width: 60, height: 26 },
+    { id: "w6", text: "has", x: 90, y: 470, width: 60, height: 26 },
+    { id: "w7", text: "books", x: 170, y: 470, width: 80, height: 26 }
+  ];
+  assert.deepEqual(
+    selectGoogleHandwrittenWords(words).map((item) => item.id),
+    ["w1", "w2", "w4", "w5", "w6", "w7"]
+  );
+});
+
 test("a one-word wrapped ending remains part of the handwritten document", () => {
   const words = [
     word("w1", "She", 120, 100), word("w2", "finished", 220, 100),
@@ -494,17 +510,87 @@ test("a pure word-order error changes only the words that moved", () => {
   );
 });
 
+test("a fronted lexical verb outside any hardcoded list is still reordered (dictionary-based detection)", () => {
+  const words = [word("w1", "Wishes", 10), word("w2", "he", 90), word("w3", "he", 160), word("w4", "could", 230), word("w5", "fly", 300)];
+  const corrections = detectDeterministicGrammar(words);
+  assert.deepEqual(
+    corrections.map(({ action, original, replacement, target_ids }) => ({ action, original, replacement, target_ids })),
+    [
+      { action: "rewrite_line", original: "Wishes he", replacement: "He wishes", target_ids: ["w1", "w2"] }
+    ]
+  );
+});
+
+test("a question's auxiliary is never treated as a fronted verb", () => {
+  const words = [word("w1", "Does", 10), word("w2", "he", 90), word("w3", "play", 160), word("w4", "football", 230)];
+  const corrections = detectDeterministicGrammar(words);
+  assert.equal(corrections.length, 0);
+});
+
+test("a question's auxiliary keeps have in its base form, not has", () => {
+  const words = [word("w1", "Does", 10), word("w2", "he", 90), word("w3", "have", 160), word("w4", "a", 230), word("w5", "dog", 300)];
+  const corrections = detectDeterministicGrammar(words);
+  assert.equal(corrections.length, 0);
+});
+
 test("a fronted lexical verb is deterministically reordered before a pronoun subject", () => {
   const words = [word("w1", "Likes", 10), word("w2", "She", 90), word("w3", "football", 160)];
   const corrections = detectDeterministicGrammar(words);
   assert.deepEqual(
-    corrections.map(({ original, replacement, target_id }) => ({ original, replacement, target_id })),
+    corrections.map(({ action, original, replacement, target_ids }) => ({ action, original, replacement, target_ids })),
     [
-      { original: "Likes", replacement: "She", target_id: "w1" },
-      { original: "She", replacement: "likes", target_id: "w2" }
+      { action: "rewrite_line", original: "Likes She", replacement: "She likes", target_ids: ["w1", "w2"] }
     ]
   );
-  assert.equal(corrections.some((item) => item.target_id === "w3"), false);
+  assert.equal(corrections.some((item) => (item.target_ids || []).includes("w3")), false);
+});
+
+test("a verb that already has its own subject is left alone even when a pronoun follows it", () => {
+  const words = [
+    word("w1", "My", 10), word("w2", "brother", 90), word("w3", "Hopes", 170),
+    word("w4", "he", 260), word("w5", "can", 330), word("w6", "play", 400), word("w7", "football", 470)
+  ];
+  const corrections = detectDeterministicGrammar(words);
+  assert.equal(corrections.some((item) => item.target_id === "w3" || item.target_id === "w4"), false);
+});
+
+test("a fronted verb whose pronoun is needed by a following verb gets a new subject inserted instead of losing that pronoun", () => {
+  const words = [
+    word("w1", "but", 10), word("w2", "wishes", 90), word("w3", "he", 170),
+    word("w4", "had", 240), word("w5", "more", 310), word("w6", "time", 380)
+  ];
+  const corrections = detectDeterministicGrammar(words);
+  assert.deepEqual(corrections, [
+    { action: "insert", original: "", replacement: "he", reason: "Add the missing subject before the verb.", target_id: "", left_id: "w1", right_id: "w2" }
+  ]);
+});
+
+test("the same insert case also lowercases a wrongly capitalized fronted verb that is no longer sentence-initial", () => {
+  const words = [
+    word("w1", "but", 10), word("w2", "Wishes", 90), word("w3", "he", 170),
+    word("w4", "had", 240), word("w5", "more", 310), word("w6", "time", 380)
+  ];
+  const corrections = detectDeterministicGrammar(words);
+  const insert = corrections.find((item) => item.action === "insert");
+  const lowercased = corrections.find((item) => item.target_id === "w2");
+  assert.deepEqual(insert && { left_id: insert.left_id, right_id: insert.right_id, replacement: insert.replacement },
+    { left_id: "w1", right_id: "w2", replacement: "he" });
+  assert.equal(lowercased && lowercased.replacement, "wishes");
+});
+
+test("a fronted lexical verb is reordered even when its pronoun subject wraps to the next physical line", () => {
+  const words = [
+    word("w1", "but", 10, 100), word("w2", "feels", 90, 100),
+    word("w3", "he", 10, 160), word("w4", "tired", 90, 160)
+  ];
+  const group = { id: "g1", words: [words[0], words[1], words[2], words[3]] };
+  const corrections = detectDeterministicGrammar(words, [group]);
+  assert.deepEqual(
+    corrections.map(({ action, original, replacement, target_ids }) => ({ action, original, replacement, target_ids })),
+    [
+      { action: "rewrite_line", original: "feels he", replacement: "he feels", target_ids: ["w2", "w3"] }
+    ]
+  );
 });
 
 test("the typed transcript drops wrong words entirely and marks only the correction red", () => {
@@ -672,10 +758,11 @@ test("a word-order error is found after another clause on the same physical line
     word("w1", "they", 10), word("w2", "study", 80), word("w3", "hard", 150),
     word("w4", "Likes", 230), word("w5", "he", 310), word("w6", "football", 370)
   ];
-  const byTarget = new Map(detectDeterministicGrammar(words).map((item) => [item.target_id, item.replacement]));
-  assert.equal(byTarget.get("w4"), "He");
-  assert.equal(byTarget.get("w5"), "likes");
-  assert.equal(byTarget.has("w6"), false);
+  const corrections = detectDeterministicGrammar(words);
+  const rewrite = corrections.find((item) => item.action === "rewrite_line");
+  assert.deepEqual(rewrite.target_ids, ["w4", "w5"]);
+  assert.equal(rewrite.replacement, "He likes");
+  assert.equal(corrections.some((item) => (item.target_ids || []).includes("w6")), false);
 });
 
 test("a past marker tolerates one-character OCR noise in an irregular verb", () => {
@@ -870,6 +957,34 @@ test("a capitalized proper name mid-sentence is left alone by the capitalization
   assert.equal(corrections.length, 0);
 });
 
+test("a mid-sentence content verb wrongly capitalized is lowercased even with its own subject before it", () => {
+  const group = sentence(["My", "brother", "Hopes", "he", "can", "play", "football"])[0];
+  const corrections = detectCapitalizationErrors([group]);
+  assert.deepEqual(corrections.map((item) => ({ target_id: item.target_id, replacement: item.replacement })), [
+    { target_id: "s2", replacement: "hopes" }
+  ]);
+});
+
+test("a real first name mid-sentence is never lowercased even when it looks like a common verb", () => {
+  const group = sentence(["My", "brother", "Mark", "called", "me"])[0];
+  const corrections = detectCapitalizationErrors([group]);
+  assert.equal(corrections.length, 0);
+});
+
+test("a sentence's own first word is capitalized when OCR reads it lowercase", () => {
+  const group = sentence(["my", "coach", "insisted"])[0];
+  const corrections = detectCapitalizationErrors([group]);
+  assert.deepEqual(corrections.map((item) => ({ target_id: item.target_id, replacement: item.replacement })), [
+    { target_id: "s0", replacement: "My" }
+  ]);
+});
+
+test("an already-capitalized first word is left alone", () => {
+  const group = sentence(["My", "coach", "insisted"])[0];
+  const corrections = detectCapitalizationErrors([group]);
+  assert.equal(corrections.length, 0);
+});
+
 test("a proper name right after a conjunction in an inverted sentence is never flagged", () => {
   const group = sentence(["He", "went", "home", "and", "Ahmet", "stayed", "at", "school"])[0];
   const corrections = detectCapitalizationErrors([group]);
@@ -1003,6 +1118,20 @@ test("yesterday triggers a nearby irregular past-tense correction", () => {
   ];
   const correction = detectDeterministicGrammar(words).find((item) => item.target_id === "w7");
   assert.equal(correction.replacement, "went");
+});
+
+test("an irregular past-tense fix on a fronted verb is not discarded by the word-order swap", () => {
+  const words = [
+    word("w1", "Yesterday", 10), word("w2", "go", 130), word("w3", "I", 200),
+    word("w4", "to", 260), word("w5", "the", 310), word("w6", "park", 370)
+  ];
+  // detectDeterministicGrammar can return two conflicting proposals for the
+  // same word (a tense fix and a word-order swap); resolving that conflict
+  // is mergeCorrections' job (first pushed wins), the same as in the real
+  // pipeline, so the check runs through it rather than the raw list.
+  const corrections = mergeCorrections(detectDeterministicGrammar(words));
+  assert.equal(corrections.some((item) => item.target_id === "w2" && item.replacement === "went"), true);
+  assert.equal(corrections.some((item) => (item.target_ids || []).includes("w2")), false);
 });
 
 test("yesterday tolerates a handwritten OCR confusion for go", () => {
@@ -1163,6 +1292,12 @@ test("a model phrase rewrite cannot overwrite a higher-priority anchored correct
     target_ids: ["w3", "w4"],
     target_id: "", left_id: "", right_id: ""
   };
+  assert.deepEqual(mergeCorrections([deterministic], [model]), [deterministic]);
+});
+
+test("a model insert anchored beside a word a higher-priority correction already rewrote is dropped", () => {
+  const deterministic = { action: "replace", original: "he", replacement: "feels", target_id: "w3", left_id: "", right_id: "" };
+  const model = { action: "insert", original: "", replacement: "is", target_id: "", left_id: "w3", right_id: "w4" };
   assert.deepEqual(mergeCorrections([deterministic], [model]), [deterministic]);
 });
 

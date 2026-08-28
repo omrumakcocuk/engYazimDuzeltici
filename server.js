@@ -6,6 +6,7 @@ const os = require("node:os");
 const { execFile, spawn } = require("node:child_process");
 const { promisify } = require("node:util");
 const { ImageAnnotatorClient } = require("@google-cloud/vision");
+const nlp = require("compromise");
 
 const execFileAsync = promisify(execFile);
 
@@ -184,11 +185,18 @@ async function correctLetter(req, res) {
     const finalCorrections = mergeCorrections(
       advancedCorrections,
       deterministicCorrections,
-      capitalizationCorrections,
       filterProtectedProperNames(
         filterLikelyOcrArtifacts(grammaticallyAligned),
         sentenceGroups
-      )
+      ),
+      // Capitalization fixes only ever touch a word's case, never its
+      // spelling or tense, so they are deliberately lowest priority here:
+      // if the model already proposed a content fix for this exact word
+      // (e.g. "Practice" -> "practiced"), that fix already corrects the
+      // case too and must win, rather than this rule claiming the word
+      // first with a same-case-only fix and silently discarding the
+      // model's more specific correction.
+      capitalizationCorrections
     ).map(trimRewriteToChangedSpan);
 
     const transcript = buildCorrectionTranscript(sentenceGroups, finalCorrections, punctuationByWordId);
@@ -201,7 +209,7 @@ async function correctLetter(req, res) {
             id: group.id,
             lineIds: group.lineIds,
             text: group.text,
-            words: group.words.map((word) => ({ id: word.id, text: word.text, x: word.x, y: word.y }))
+            words: group.words.map((word) => ({ id: word.id, text: word.text, x: word.x, y: word.y, width: word.width, height: word.height, punct: word.punct }))
           })),
           corrections: anchoredCorrections
         }, null, 2));
@@ -457,8 +465,25 @@ function selectGoogleHandwrittenWords(words) {
     return withinHorizontalTextBand && isPlausibleHandwritingSize
       && closestDistance <= Math.max(85, typicalHeight * 2.7);
   });
-  const documentWords = documentLines.flatMap((line) => line.words)
-    .filter((word) => /^[A-Za-z0-9']+$/.test(word.text));
+  // A stray punctuation mark or ink speck can be misread by OCR as a short
+  // alphabetic "word" (e.g. a period read as "po"). The line-level checks
+  // above only inspect size when a line has exactly one meaningful word, so
+  // a speck sharing a physical line with real handwriting would otherwise
+  // slip through untouched. The comparison here is against that word's own
+  // line (not the page-wide typicalHeight above) specifically so that a
+  // whole line of legitimately smaller handwriting - e.g. from camera
+  // perspective distortion at the top of a photographed page - is never
+  // discarded just because it is uniformly smaller than other lines; only a
+  // word that stands out as anomalously small next to its own line-mates is
+  // treated as noise.
+  const documentWords = documentLines.flatMap((line) => {
+    const meaningfulOnLine = line.words.filter((word) => /^[A-Za-z']{2,}$/.test(word.text));
+    if (meaningfulOnLine.length < 2) return line.words;
+    const lineTypicalHeight = meaningfulOnLine.map((word) => word.height).sort((a, b) => a - b)[
+      Math.floor(meaningfulOnLine.length / 2)
+    ];
+    return line.words.filter((word) => word.height >= lineTypicalHeight * 0.42);
+  }).filter((word) => /^[A-Za-z0-9']+$/.test(word.text));
   return selectHandwrittenWords(documentWords.length >= 2 ? documentWords : words);
 }
 
@@ -1757,10 +1782,107 @@ const comparativeAdjectives = new Set([
   "braver", "wiser", "louder", "quieter", "simpler"
 ]);
 
+// Auxiliaries, modals and copulas legitimately front a pronoun in a
+// question ("Does he play?", "Is he tired?", "Can he come?"), unlike an
+// ordinary lexical verb, which never does in a declarative sentence - so
+// these must never be treated as a fronted-verb mistake.
+const AUXILIARY_OR_COPULA_VERBS = new Set([
+  "is", "am", "are", "was", "were", "be", "been", "being",
+  "do", "does", "did", "have", "has", "had",
+  "can", "could", "will", "would", "shall", "should", "may", "might", "must"
+]);
+const wordTagsCache = new Map();
+function getWordTags(word) {
+  if (!word || !/^[a-z']+$/.test(word)) return [];
+  if (wordTagsCache.has(word)) return wordTagsCache.get(word);
+  // Tagging the word by itself (rather than inside the broken sentence)
+  // matters: a POS tagger given the whole erroring sentence tends to
+  // "rationalize" a verb sitting in the wrong position by reinterpreting
+  // it as a noun instead of flagging the error, which would defeat the
+  // purpose here. Tagged alone, its dictionary part of speech comes through.
+  const tagged = nlp(word).terms().out("tags")[0];
+  const tags = tagged ? Object.values(tagged)[0] || [] : [];
+  wordTagsCache.set(word, tags);
+  return tags;
+}
+function isFrontableLexicalVerb(word) {
+  if (AUXILIARY_OR_COPULA_VERBS.has(word)) return false;
+  const tags = getWordTags(word);
+  // Excluding a word the dictionary also recognizes as a person's name is
+  // an extra safety margin: compromise already prefers the name reading
+  // for a genuinely ambiguous word (e.g. "Mark", "Will", "Grant" come back
+  // tagged Noun/Modal, not Verb, so this rarely changes anything), but it
+  // costs nothing to check explicitly given this same tag now also drives
+  // deciding whether to strip a capital letter off a real name.
+  if (tags.includes("Person") || tags.includes("ProperNoun")) return false;
+  return tags.includes("Verb") && tags.includes("PresentTense");
+}
+function isAnyVerbWord(word) {
+  return getWordTags(word).includes("Verb");
+}
+
+function frontedVerbPronounCorrections(tokens, index) {
+  const verbWord = tokens[index];
+  const pronounWord = tokens[index + 1];
+  const previousWord = tokens[index - 1];
+  if (previousWord) {
+    const previousNormalized = previousWord.text.toLowerCase().replace(/[^a-z0-9']/g, "");
+    const previousTags = getWordTags(previousNormalized);
+    // A noun or pronoun immediately before the verb is already its subject
+    // ("My brother hopes he can play football" - "hopes" already has
+    // "brother" as its subject, so the trailing "he" is the subject of the
+    // embedded clause, not a fronted subject for "hopes" itself). Without
+    // this check, an ordinary verb that legitimately follows its own
+    // subject would be mistaken for an inversion just because a pronoun
+    // happens to follow it too.
+    if (previousTags.includes("Noun") || previousTags.includes("Pronoun")) return [];
+  }
+  const nextWord = tokens[index + 2];
+  const nextNormalized = nextWord ? nextWord.text.toLowerCase().replace(/[^a-z0-9']/g, "") : "";
+  // If the word right after the pronoun is itself a verb ("wishes he had
+  // more time"), the pronoun is the subject of THAT verb, not a spare copy
+  // that can be relocated in front of the fronted verb - moving it would
+  // leave the following verb without a subject ("he wishes had more
+  // time"). Supplying a new subject via insert, rather than relocating the
+  // existing pronoun, keeps both verbs correctly supplied.
+  if (nextWord && isAnyVerbWord(nextNormalized) && index > 0) {
+    const corrections = [makeInsert(
+      tokens[index - 1], verbWord, pronounWord.text.toLowerCase(),
+      "Add the missing subject before the verb."
+    )];
+    if (/^[A-Z]/.test(verbWord.text)) {
+      corrections.push(makeReplace(
+        verbWord, verbWord.text.toLowerCase(),
+        "This word is not the start of the sentence, so it should not be capitalized."
+      ));
+    }
+    return corrections;
+  }
+  const subject = /^[A-Z]/.test(verbWord.text)
+    ? pronounWord.text.charAt(0).toUpperCase() + pronounWord.text.slice(1)
+    : pronounWord.text;
+  // A single rewrite_line covering both words (rather than two independent
+  // replace corrections) makes the swap atomic: if either word is already
+  // claimed by a more specific correction (e.g. a tense fix on the verb
+  // itself), the whole reorder is skipped instead of only half-applying and
+  // leaving a broken result (the verb's new tense stranded with no subject,
+  // or the subject duplicated).
+  return [{
+    action: "rewrite_line",
+    original: `${verbWord.text} ${pronounWord.text}`,
+    replacement: `${subject} ${verbWord.text.toLowerCase()}`,
+    reason: "In English statements, the subject comes before the verb (word order).",
+    target_ids: [verbWord.id, pronounWord.id],
+    target_id: "", left_id: "", right_id: ""
+  }];
+}
+
 function detectDeterministicGrammar(words, sentenceGroups = []) {
   const possessives = new Set(["my", "your", "his", "her", "our", "their"]);
   const linkingVerbs = new Set(["am", "is", "are", "was", "were"]);
   const corrections = [];
+  const frontedVerbCorrections = [];
+  const subjectPronouns = new Set(["he", "she", "it", "we", "they", "you", "i"]);
 
   // Geometry fallback for introductions. It does not depend on sentence
   // grouping, which may split a curved first line. Only join a visible
@@ -1791,20 +1913,9 @@ function detectDeterministicGrammar(words, sentenceGroups = []) {
     const tokens = [...line.words].sort((a, b) => a.x - b.x);
     const normalized = tokens.map((word) => word.text.toLowerCase().replace(/[^a-z0-9']/g, ""));
 
-    const subjectPronouns = new Set(["he", "she", "it", "we", "they", "you", "i"]);
-    const frontedLexicalVerbs = new Set([
-      "likes", "loves", "enjoys", "prefers", "plays", "reads", "writes",
-      "watches", "runs", "walks", "sings", "swims", "studies", "works"
-    ]);
     for (let index = 0; index <= tokens.length - 3; index += 1) {
-      if (!frontedLexicalVerbs.has(normalized[index]) || !subjectPronouns.has(normalized[index + 1])) continue;
-      const subject = /^[A-Z]/.test(tokens[index].text)
-        ? tokens[index + 1].text.charAt(0).toUpperCase() + tokens[index + 1].text.slice(1)
-        : tokens[index + 1].text;
-      corrections.push(
-        makeReplace(tokens[index], subject),
-        makeReplace(tokens[index + 1], tokens[index].text.toLowerCase())
-      );
+      if (!isFrontableLexicalVerb(normalized[index]) || !subjectPronouns.has(normalized[index + 1])) continue;
+      frontedVerbCorrections.push(...frontedVerbPronounCorrections(tokens, index));
     }
 
     // The same fronted-verb mistake also happens with a short noun-phrase
@@ -1821,7 +1932,7 @@ function detectDeterministicGrammar(words, sentenceGroups = []) {
       // enjoys the reptile house"), so this only applies when the verb opens
       // the line - that is the shape that is actually always wrong.
       if (index !== 0) continue;
-      if (!frontedLexicalVerbs.has(normalized[index])) continue;
+      if (!isFrontableLexicalVerb(normalized[index])) continue;
       if (!subjectDeterminers.has(normalized[index + 1])) continue;
       if (!/^[a-z']+$/.test(normalized[index + 2] || "")) continue;
       const verbWord = tokens[index];
@@ -1855,15 +1966,23 @@ function detectDeterministicGrammar(words, sentenceGroups = []) {
       ["prefers", "prefer"], ["plays", "play"], ["reads", "read"],
       ["watches", "watch"], ["studies", "study"]
     ]);
+    // A question auxiliary or modal directly before the subject already
+    // carries the verb's person/number, so the main verb after the subject
+    // stays in its base form ("Does he play?", "Can he play?") - unlike a
+    // plain declarative clause, where a singular subject takes the -s form.
+    const baseFormAuxiliaries = new Set([
+      "does", "did", "do", "can", "could", "will", "would", "shall", "should", "may", "might", "must"
+    ]);
     for (let index = 0; index < normalized.length; index += 1) {
       const token = normalized[index];
       const previous = normalized[index - 1];
       const previousPrevious = normalized[index - 2];
+      const governedByAuxiliary = baseFormAuxiliaries.has(previousPrevious);
 
-      if (singularPronouns.has(previous) && token === "have") {
+      if (singularPronouns.has(previous) && token === "have" && !governedByAuxiliary) {
         corrections.push(makeReplace(tokens[index], "has"));
       }
-      if (singularPronouns.has(previous) && singularPreference.has(token)) {
+      if (singularPronouns.has(previous) && singularPreference.has(token) && !governedByAuxiliary) {
         corrections.push(makeReplace(tokens[index], singularPreference.get(token)));
       }
       if (pluralPronouns.has(previous) && token === "was") {
@@ -1957,6 +2076,23 @@ function detectDeterministicGrammar(words, sentenceGroups = []) {
       });
     }
 
+  }
+
+  // The pronoun-fronted-verb check above is scoped to a single physical
+  // line, so it cannot see a fronted-verb inversion that happens to fall
+  // across a handwritten line wrap (the verb ends one line, its pronoun
+  // subject starts the next). A sentence group's own word order already
+  // reflects correct reading order across such wraps, so re-running the
+  // identical check there catches what the physical-line pass alone cannot.
+  // Any overlap with a same-line match found above is harmless: mergeCorrections
+  // deduplicates by target word id.
+  for (const group of sentenceGroups) {
+    const groupTokens = group.words || [];
+    const groupNormalized = groupTokens.map((word) => word.text.toLowerCase().replace(/[^a-z0-9']/g, ""));
+    for (let index = 0; index < groupTokens.length - 1; index += 1) {
+      if (!isFrontableLexicalVerb(groupNormalized[index]) || !subjectPronouns.has(groupNormalized[index + 1])) continue;
+      frontedVerbCorrections.push(...frontedVerbPronounCorrections(groupTokens, index));
+    }
   }
 
   const orderedLines = groupOcrWordsIntoLines(words)
@@ -2179,6 +2315,14 @@ function detectDeterministicGrammar(words, sentenceGroups = []) {
     }
 
   }
+  // Fronted-verb-pronoun corrections are collected separately and appended
+  // last so that a more specific rule above (e.g. the "yesterday" irregular
+  // past-tense fix) always wins a conflict over the same word: this rule
+  // only reorders words and does not know about tense/spelling, so if
+  // another rule already needs to change that exact word's form, deferring
+  // to it avoids silently discarding a needed content fix in favor of a
+  // pure reorder.
+  corrections.push(...frontedVerbCorrections);
   return corrections;
 }
 
@@ -2208,12 +2352,33 @@ function detectCapitalizationErrors(sentenceGroups) {
   const corrections = [];
   for (const group of sentenceGroups) {
     group.words.forEach((word, index) => {
-      if (index === 0) return;
+      const firstChar = word.text.charAt(0);
+      if (index === 0) {
+        // A sentence's own first letter is always capitalized in English,
+        // regardless of what the word is - unlike the mid-sentence case
+        // below, this needs no word-list check to stay safe from clobbering
+        // proper nouns, since capitalizing an already-capitalized word is a
+        // no-op.
+        if (firstChar && firstChar !== firstChar.toUpperCase() && firstChar === firstChar.toLowerCase()) {
+          const replacement = firstChar.toUpperCase() + word.text.slice(1);
+          corrections.push(makeReplace(
+            word, replacement,
+            `Every sentence starts with a capital letter; “${word.text}” begins this sentence, so its first letter should be capitalized.`
+          ));
+        }
+        return;
+      }
       const plain = word.text.replace(/[^A-Za-z']/g, "");
       if (!/^[A-Z][a-z']*$/.test(plain)) return;
       const lower = plain.toLowerCase();
       if (lower === "i") return;
-      if (!MID_SENTENCE_LOWERCASE_WORDS.has(lower)) return;
+      // Beyond the fixed function-word list, a word the dictionary tags as
+      // an ordinary present-tense lexical verb (checked on its own, not in
+      // this broken sentence - see isFrontableLexicalVerb) is also safe to
+      // lowercase: compromise tags real first names as Person/ProperNoun
+      // instead, even for names that are spelled like common verbs (e.g.
+      // "Will", "Grant", "Mark"), so this does not risk touching a name.
+      if (!MID_SENTENCE_LOWERCASE_WORDS.has(lower) && !isFrontableLexicalVerb(lower)) return;
       const replacement = word.text.charAt(0).toLowerCase() + word.text.slice(1);
       corrections.push(makeReplace(
         word, replacement,
@@ -2444,7 +2609,13 @@ function mergeCorrections(...groups) {
   for (const item of groups.flat()) {
     if (item.action === "replace" && claimedIds.has(item.target_id)) continue;
     if (item.action === "rewrite_line" && (item.target_ids || []).some((id) => claimedIds.has(id))) continue;
-    if (item.action === "insert" && claimedIds.has(item.left_id) && claimedIds.has(item.right_id)) continue;
+    // An insert anchored right next to a word a higher-priority correction
+    // already rewrote is built on a now-stale picture of that neighboring
+    // text (a lower-priority source proposed it without knowing the word
+    // beside it was about to change), so it is dropped rather than risking
+    // a broken combination - unlike replace/rewrite_line, it is enough for
+    // either side of the insert to be claimed, not both.
+    if (item.action === "insert" && (claimedIds.has(item.left_id) || claimedIds.has(item.right_id))) continue;
     const key = item.action === "replace"
       ? `replace|${item.target_id}`
       : item.action === "rewrite_line"
