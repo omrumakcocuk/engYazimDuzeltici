@@ -463,6 +463,22 @@ test("a stray punctuation mark misread as a tiny word on a real handwriting line
   );
 });
 
+test("a device's own status bar text photographed above a full page of real handwriting is dropped", () => {
+  const words = [
+    { id: "s1", text: "Agu", x: 85, y: 0, width: 34, height: 9 },
+    { id: "s2", text: "Cum", x: 125, y: 0, width: 36, height: 8 },
+    { id: "s3", text: "de", x: 286, y: 57, width: 41, height: 19 },
+    { id: "s4", text: "Q", x: 349, y: 60, width: 37, height: 18 },
+    word("w1", "Yesterday", 50, 158), word("w2", "my", 295, 160), word("w3", "family", 375, 160),
+    word("w4", "and", 30, 209), word("w5", "I", 171, 209), word("w6", "went", 300, 209),
+    word("w7", "to", 30, 260), word("w8", "the", 171, 260), word("w9", "beach", 300, 260),
+    word("w10", "yesterday", 30, 311), word("w11", "and", 171, 311), word("w12", "smiled", 300, 311)
+  ];
+  const kept = selectGoogleHandwrittenWords(words).map((item) => item.id);
+  assert.equal(kept.some((id) => ["s1", "s2", "s3", "s4"].includes(id)), false);
+  assert.deepEqual(kept, ["w1", "w2", "w3", "w4", "w5", "w6", "w7", "w8", "w9", "w10", "w11", "w12"]);
+});
+
 test("a one-word wrapped ending remains part of the handwritten document", () => {
   const words = [
     word("w1", "She", 120, 100), word("w2", "finished", 220, 100),
@@ -1014,6 +1030,14 @@ test("a mid-sentence content verb wrongly capitalized is lowercased even with it
   const corrections = detectCapitalizationErrors([group]);
   assert.deepEqual(corrections.map((item) => ({ target_id: item.target_id, replacement: item.replacement })), [
     { target_id: "s2", replacement: "hopes" }
+  ]);
+});
+
+test("a past-tense content verb wrongly capitalized mid-sentence is also lowercased", () => {
+  const group = sentence(["We", "Stayed", "until", "it", "got", "dark"])[0];
+  const corrections = detectCapitalizationErrors([group]);
+  assert.deepEqual(corrections.map((item) => ({ target_id: item.target_id, replacement: item.replacement })), [
+    { target_id: "s1", replacement: "stayed" }
   ]);
 });
 

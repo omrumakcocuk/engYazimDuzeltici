@@ -134,6 +134,12 @@ async function correctLetter(req, res) {
   try {
     const recognizedWords = await recognizeGoogleWordsCached(workingImage);
     words = selectGoogleHandwrittenWords(recognizedWords);
+    if (process.env.DEBUG_CORRECTIONS) {
+      fs.writeFileSync(path.join(__dirname, "debug_raw_words.json"), JSON.stringify({
+        recognizedWords: recognizedWords.map((w) => ({ text: w.text, x: w.x, y: w.y, width: w.width, height: w.height })),
+        selectedWords: words.map((w) => ({ text: w.text, x: w.x, y: w.y, width: w.width, height: w.height }))
+      }, null, 2));
+    }
   } catch (error) {
     console.error(error);
     return json(res, 500, { error: error.message || "Google Cloud Vision fotografi okuyamadi." });
@@ -448,8 +454,30 @@ function selectGoogleHandwrittenWords(words) {
       Math.floor(strongLines.flatMap((line) => line.words).length / 2)
     ]
     : 30;
+  // A line with two or more real-looking words is usually trustworthy on
+  // word count alone, but a device's own UI chrome (e.g. its status bar,
+  // photographed above the actual notebook page) can also cluster several
+  // short, dictionary-real words together and would otherwise sail through
+  // untouched, since the size check below only ever ran for a line with
+  // exactly one meaningful word. A strong line's size only disqualifies it
+  // once the rest of the document clearly establishes what "normal" looks
+  // like here (several other much taller strong lines): a short document
+  // without enough lines to compare against is left alone, so a genuinely
+  // smaller page - e.g. from camera perspective distortion - is never
+  // discarded just because nothing bigger sits nearby to judge it against.
+  const dominantBodyLineCount = strongLines.filter((line) => {
+    const heights = [...line.words.map((word) => word.height)].sort((a, b) => a - b);
+    const lineMedianHeight = heights[Math.floor(heights.length / 2)];
+    return lineMedianHeight >= typicalHeight * 0.7;
+  }).length;
+  const hasDominantBody = dominantBodyLineCount >= 3;
   const documentLines = allLines.filter((line) => {
-    if (strongLines.includes(line)) return true;
+    if (strongLines.includes(line)) {
+      if (!hasDominantBody) return true;
+      const heights = [...line.words.map((word) => word.height)].sort((a, b) => a - b);
+      const lineMedianHeight = heights[Math.floor(heights.length / 2)];
+      return lineMedianHeight >= typicalHeight * 0.42;
+    }
     const meaningfulWords = line.words.filter((word) => /^[A-Za-z']{2,}$/.test(word.text));
     if (meaningfulWords.length !== 1 || !strongLines.length) return false;
     const closestDistance = Math.min(...strongLines.map((candidate) => Math.abs(candidate.centerY - line.centerY)));
@@ -1821,6 +1849,17 @@ function isFrontableLexicalVerb(word) {
   if (tags.includes("Person") || tags.includes("ProperNoun")) return false;
   return tags.includes("Verb") && tags.includes("PresentTense");
 }
+// Same idea as isFrontableLexicalVerb, but for capitalization: an ordinary
+// verb is never legitimately capitalized mid-sentence regardless of its
+// tense, whereas fronted-verb reordering only ever needs the present-tense
+// "verb-s pronoun" inversion shape, so that check stays narrower.
+function isOrdinaryLexicalVerb(word) {
+  if (AUXILIARY_OR_COPULA_VERBS.has(word)) return false;
+  const tags = getWordTags(word);
+  if (tags.includes("Person") || tags.includes("ProperNoun")) return false;
+  return tags.includes("Verb")
+    && (tags.includes("PresentTense") || tags.includes("PastTense") || tags.includes("Gerund") || tags.includes("Infinitive"));
+}
 function isAnyVerbWord(word) {
   return getWordTags(word).includes("Verb");
 }
@@ -2422,12 +2461,12 @@ function detectCapitalizationErrors(sentenceGroups) {
       if (!/^[A-Z][a-z']*$/.test(plain)) return;
       if (lower === "i") return;
       // Beyond the fixed function-word list, a word the dictionary tags as
-      // an ordinary present-tense lexical verb (checked on its own, not in
-      // this broken sentence - see isFrontableLexicalVerb) is also safe to
+      // an ordinary lexical verb, in any tense (checked on its own, not in
+      // this broken sentence - see isOrdinaryLexicalVerb) is also safe to
       // lowercase: compromise tags real first names as Person/ProperNoun
       // instead, even for names that are spelled like common verbs (e.g.
       // "Will", "Grant", "Mark"), so this does not risk touching a name.
-      if (!MID_SENTENCE_LOWERCASE_WORDS.has(lower) && !isFrontableLexicalVerb(lower)) return;
+      if (!MID_SENTENCE_LOWERCASE_WORDS.has(lower) && !isOrdinaryLexicalVerb(lower)) return;
       const replacement = word.text.charAt(0).toLowerCase() + word.text.slice(1);
       corrections.push(makeReplace(
         word, replacement,
