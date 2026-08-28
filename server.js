@@ -1821,7 +1821,17 @@ const comparativeAdjectives = new Set([
 const AUXILIARY_OR_COPULA_VERBS = new Set([
   "is", "am", "are", "was", "were", "be", "been", "being",
   "do", "does", "did", "have", "has", "had",
-  "can", "could", "will", "would", "shall", "should", "may", "might", "must"
+  "can", "could", "will", "would", "shall", "should", "may", "might", "must",
+  // Negative contractions, with and without the apostrophe (OCR frequently
+  // drops it from handwriting): the dictionary tags several of these
+  // (e.g. "doesnt" alone) as an ordinary noun instead of recognizing the
+  // contraction, so they need to be listed explicitly rather than relying
+  // on the tagger here.
+  "dont", "don't", "doesnt", "doesn't", "didnt", "didn't",
+  "cant", "can't", "couldnt", "couldn't", "wont", "won't", "wouldnt", "wouldn't",
+  "shouldnt", "shouldn't", "mustnt", "mustn't",
+  "isnt", "isn't", "arent", "aren't", "wasnt", "wasn't", "werent", "weren't",
+  "havent", "haven't", "hasnt", "hasn't", "hadnt", "hadn't"
 ]);
 const wordTagsCache = new Map();
 function getWordTags(word) {
@@ -1877,8 +1887,12 @@ function frontedVerbPronounCorrections(tokens, index, sentenceStartIds) {
     // embedded clause, not a fronted subject for "hopes" itself). Without
     // this check, an ordinary verb that legitimately follows its own
     // subject would be mistaken for an inversion just because a pronoun
-    // happens to follow it too.
-    if (previousTags.includes("Noun") || previousTags.includes("Pronoun")) return [];
+    // happens to follow it too. A negative auxiliary right before the verb
+    // is the same situation in disguise: "I can't wait, but don't think we
+    // have packed" - "think" already has its subject established (elided,
+    // via "don't"), so the trailing "we" belongs to the embedded clause
+    // "we have packed", not to "think".
+    if (previousTags.includes("Noun") || previousTags.includes("Pronoun") || AUXILIARY_OR_COPULA_VERBS.has(previousNormalized)) return [];
   }
   const nextWord = tokens[index + 2];
   const nextNormalized = nextWord ? nextWord.text.toLowerCase().replace(/[^a-z0-9']/g, "") : "";
@@ -1958,6 +1972,24 @@ function detectDeterministicGrammar(words, sentenceGroups = [], punctuationByWor
       || sentenceEndingMarksForStart.has(previousEffectivePunct);
     if (hasReliableBoundary) sentenceStartIds.add(firstWord.id);
   });
+  // Two consecutive words on the same physical line can still belong to two
+  // different sentences (a line wraps mid-sentence, or one sentence simply
+  // ends and the next begins partway across the line). Without knowing
+  // that, the fronted-verb check below can pair a word ending one sentence
+  // with the pronoun starting the next and mistake an ordinary sentence
+  // boundary for a garbled "verb pronoun" inversion - concretely, "for a
+  // trip." followed by "I can't wait" reads as "trip I", and "trip" is a
+  // dictionary-real verb too ("to trip"), so the check tried to fix a word
+  // order problem that was never actually there.
+  const groupIdByWordId = new Map();
+  sentenceGroups.forEach((group, groupIndex) => {
+    (group.words || []).forEach((word) => groupIdByWordId.set(word.id, group.id || `group_${groupIndex}`));
+  });
+  const wordsShareSentence = (leftWord, rightWord) => {
+    if (!groupIdByWordId.size) return true;
+    const leftGroup = groupIdByWordId.get(leftWord?.id);
+    return Boolean(leftGroup) && leftGroup === groupIdByWordId.get(rightWord?.id);
+  };
   const subjectPronouns = new Set(["he", "she", "it", "we", "they", "you", "i"]);
 
   // Geometry fallback for introductions. It does not depend on sentence
@@ -1991,6 +2023,7 @@ function detectDeterministicGrammar(words, sentenceGroups = [], punctuationByWor
 
     for (let index = 0; index <= tokens.length - 3; index += 1) {
       if (!isFrontableLexicalVerb(normalized[index]) || !subjectPronouns.has(normalized[index + 1])) continue;
+      if (!wordsShareSentence(tokens[index], tokens[index + 1])) continue;
       frontedVerbCorrections.push(...frontedVerbPronounCorrections(tokens, index, sentenceStartIds));
     }
 
@@ -2011,6 +2044,7 @@ function detectDeterministicGrammar(words, sentenceGroups = [], punctuationByWor
       if (!isFrontableLexicalVerb(normalized[index])) continue;
       if (!subjectDeterminers.has(normalized[index + 1])) continue;
       if (!/^[a-z']+$/.test(normalized[index + 2] || "")) continue;
+      if (!wordsShareSentence(tokens[index], tokens[index + 1]) || !wordsShareSentence(tokens[index + 1], tokens[index + 2])) continue;
       const verbWord = tokens[index];
       const detWord = tokens[index + 1];
       const nounWord = tokens[index + 2];
@@ -2262,8 +2296,19 @@ function detectDeterministicGrammar(words, sentenceGroups = [], punctuationByWor
     const normalized = tokens.map((word) => normalizeWord(word.text));
     for (let index = 1; index < normalized.length; index += 1) {
       if (ocrAwareWordDistance(normalized[index], "dont") > 1) continue;
-      const subjectPhrase = normalized.slice(Math.max(0, index - 3), index);
       const pluralSubjects = new Set(["i", "you", "we", "they"]);
+      // A fixed 3-word lookback misses the subject once a compound sentence
+      // puts real distance between it and "don't" ("I can't wait, but
+      // don't think..." - "I" sits well outside a 3-word window, so this
+      // would otherwise default to "doesn't" and guess wrong). When
+      // sentence grouping is available, search the word's own sentence
+      // instead, not just a fixed number of words before it; the narrow
+      // window remains a fallback for callers that never pass groups.
+      const dontWord = tokens[index];
+      const group = sentenceGroups.find((candidate) => (candidate.words || []).some((w) => w.id === dontWord.id));
+      const subjectPhrase = group
+        ? group.words.slice(0, group.words.findIndex((w) => w.id === dontWord.id)).map((w) => normalizeWord(w.text))
+        : normalized.slice(Math.max(0, index - 3), index);
       if (subjectPhrase.some((token) => pluralSubjects.has(token))) continue;
       corrections.push({
         action: "replace",

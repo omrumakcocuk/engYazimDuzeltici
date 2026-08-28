@@ -584,6 +584,17 @@ test("a verb that already has its own subject is left alone even when a pronoun 
   assert.equal(corrections.some((item) => item.target_id === "w3" || item.target_id === "w4"), false);
 });
 
+test("a verb right after a negative auxiliary is left alone, since its subject is already elided from the auxiliary", () => {
+  const words = [
+    word("w1", "but", 10), word("w2", "dont", 90), word("w3", "think", 170),
+    word("w4", "we", 260), word("w5", "have", 330), word("w6", "packed", 400)
+  ];
+  const corrections = detectDeterministicGrammar(words);
+  assert.equal(corrections.some((item) => (item.target_ids || [item.target_id]).includes("w3")
+    || (item.target_ids || [item.target_id]).includes("w4")
+    || item.left_id === "w2" || item.right_id === "w3"), false);
+});
+
 test("a fronted verb whose pronoun is needed by a following verb gets a new subject inserted instead of losing that pronoun", () => {
   const words = [
     word("w1", "but", 10), word("w2", "wishes", 90), word("w3", "he", 170),
@@ -621,6 +632,20 @@ test("a fronted lexical verb is reordered even when its pronoun subject wraps to
       { action: "rewrite_line", original: "feels he", replacement: "he feels", target_ids: ["w2", "w3"] }
     ]
   );
+});
+
+test("a noun-verb-ambiguous word ending one sentence is never paired with the pronoun opening the next sentence, even on the same physical line", () => {
+  const words = [
+    word("w1", "for", 10, 100), word("w2", "a", 60, 100), { ...word("w3", "trip", 110, 100), punct: "." },
+    word("w4", "I", 200, 100), word("w5", "cant", 250, 100), word("w6", "wait", 320, 100)
+  ];
+  const groups = [
+    { id: "g1", words: [words[0], words[1], words[2]] },
+    { id: "g2", words: [words[3], words[4], words[5]] }
+  ];
+  const corrections = detectDeterministicGrammar(words, groups);
+  assert.equal(corrections.some((item) => (item.target_ids || []).includes("w3")), false);
+  assert.equal(corrections.some((item) => item.left_id === "w2" && item.right_id === "w3"), false);
 });
 
 test("the typed transcript drops wrong words entirely and marks only the correction red", () => {
@@ -1127,6 +1152,17 @@ test("a third-person singular subject changes dont to doesn't", () => {
   ];
   const correction = detectDeterministicGrammar(words).find((item) => item.target_id === "w3");
   assert.equal(correction.replacement, "doesn't");
+});
+
+test("a distant 'I' subject across a compound sentence still keeps don't, not doesn't", () => {
+  const words = [
+    word("w1", "I", 10), word("w2", "cant", 70), word("w3", "wait", 150),
+    word("w4", "but", 230), word("w5", "dont", 300), word("w6", "think", 380),
+    word("w7", "we", 460), word("w8", "have", 530), word("w9", "packed", 600)
+  ];
+  const group = { id: "g1", words };
+  const corrections = detectDeterministicGrammar(words, [group]);
+  assert.equal(corrections.some((item) => item.target_id === "w5" && item.replacement === "doesn't"), false);
 });
 
 test("a destination that requires an article receives the", () => {
