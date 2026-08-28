@@ -453,14 +453,21 @@ function showTranscript(provider) {
       } else {
         wordHtml = escapeHtml(token.text);
       }
-      if (!token.punct) return wordHtml;
       // The punctuation mark gets its own red styling independent of the
       // word - a corrected mark must not color a word that was itself
       // written correctly, and vice versa.
-      const punctHtml = token.punctChanged
-        ? `<span class="fixed">${escapeHtml(token.punct)}</span>`
-        : escapeHtml(token.punct);
-      return wordHtml + punctHtml;
+      const punctHtml = !token.punct
+        ? ""
+        : token.punctChanged
+          ? `<span class="fixed">${escapeHtml(token.punct)}</span>`
+          : escapeHtml(token.punct);
+      // Quotation marks are preserved as plain, uncolored text - they are
+      // never added or corrected, only carried through as-is, so they
+      // never earn the red "fixed" styling regardless of what happens to
+      // the word they wrap.
+      const leadingQuoteHtml = token.leadingQuote ? escapeHtml(token.leadingQuote) : "";
+      const trailingQuoteHtml = token.trailingQuote ? escapeHtml(token.trailingQuote) : "";
+      return leadingQuoteHtml + wordHtml + punctHtml + trailingQuoteHtml;
     })
     .join(" ");
   transcriptNotes.innerHTML = explained.length
