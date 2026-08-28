@@ -2899,13 +2899,21 @@ function shrinkRewriteAroundClaims(item, claimedIds, replacementTextById) {
   if (originalTokens.join(" ").toLowerCase() === replacementText.trim().toLowerCase()) {
     return { ...item, target_ids: [] };
   }
+  // The original reason described the full bundled phrase (e.g. "has a
+  // lot") and would be misleading once shrunk down to a smaller span (e.g.
+  // just "a lot") - a fresh, generic reason describing only the remaining
+  // change avoids pointing the explanation at text that is no longer what
+  // actually gets colored on the page.
+  const trimmedOriginal = originalTokens.join(" ");
+  const trimmedReplacement = replacementText.trim();
+  const genericReason = `Replace “${trimmedOriginal}” with “${trimmedReplacement}”.`;
   if (ids.length === 1) {
     return {
-      action: "replace", original: originalTokens[0], replacement: replacementText.trim(),
-      reason: item.reason, target_id: ids[0], left_id: "", right_id: ""
+      action: "replace", original: trimmedOriginal, replacement: trimmedReplacement,
+      reason: genericReason, target_id: ids[0], left_id: "", right_id: ""
     };
   }
-  return { ...item, target_ids: ids, original: originalTokens.join(" "), replacement: replacementText.trim() };
+  return { ...item, target_ids: ids, original: trimmedOriginal, replacement: trimmedReplacement, reason: genericReason };
 }
 
 function mergeCorrections(...groups) {

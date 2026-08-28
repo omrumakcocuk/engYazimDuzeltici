@@ -1516,7 +1516,7 @@ test("a bundled model rewrite is shrunk to its still-unclaimed word instead of b
   };
   assert.deepEqual(mergeCorrections([deterministic], [model]), [
     deterministic,
-    { action: "replace", original: "alot", replacement: "a lot", reason: "Replace the grammatical phrase with “has a lot”.", target_id: "w47", left_id: "", right_id: "" }
+    { action: "replace", original: "alot", replacement: "a lot", reason: "Replace “alot” with “a lot”.", target_id: "w47", left_id: "", right_id: "" }
   ]);
 });
 
