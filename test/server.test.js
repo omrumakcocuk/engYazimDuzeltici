@@ -226,6 +226,20 @@ test("normalizeGeminiPunctuation drops a sentence-ending mark placed mid-group e
   ]);
 });
 
+test("normalizeGeminiPunctuation refuses to remove a comma the student already wrote correctly", () => {
+  const group = sentence(["My", "friend", "called", "yesterday", "but", "I", "was", "busy"])[0];
+  group.words[3].punct = ",";
+  const result = normalizeGeminiPunctuation(group, [{ after_id: "s3", mark: "" }]);
+  assert.deepEqual(result, []);
+});
+
+test("normalizeGeminiPunctuation still allows removing a wrongly placed sentence-ending mark", () => {
+  const group = sentence(["My", "friend", "called", "yesterday", "but", "I", "was", "busy"])[0];
+  group.words[3].punct = ".";
+  const result = normalizeGeminiPunctuation(group, [{ after_id: "s3", mark: "" }]);
+  assert.deepEqual(result, [{ after_id: "s3", mark: "" }]);
+});
+
 test("the typed transcript adds a missing comma without altering an unrelated word correction", () => {
   const group = sentence(["My", "sister", "enjoy", "cats", "and", "dogs"])[0];
   group.words[3].punct = "";
@@ -512,7 +526,7 @@ test("a pure word-order error changes only the words that moved", () => {
 
 test("a fronted lexical verb outside any hardcoded list is still reordered (dictionary-based detection)", () => {
   const words = [word("w1", "Wishes", 10), word("w2", "he", 90), word("w3", "he", 160), word("w4", "could", 230), word("w5", "fly", 300)];
-  const corrections = detectDeterministicGrammar(words);
+  const corrections = mergeCorrections(detectDeterministicGrammar(words, [{ id: "g1", words }]));
   assert.deepEqual(
     corrections.map(({ action, original, replacement, target_ids }) => ({ action, original, replacement, target_ids })),
     [
@@ -535,7 +549,7 @@ test("a question's auxiliary keeps have in its base form, not has", () => {
 
 test("a fronted lexical verb is deterministically reordered before a pronoun subject", () => {
   const words = [word("w1", "Likes", 10), word("w2", "She", 90), word("w3", "football", 160)];
-  const corrections = detectDeterministicGrammar(words);
+  const corrections = mergeCorrections(detectDeterministicGrammar(words, [{ id: "g1", words }]));
   assert.deepEqual(
     corrections.map(({ action, original, replacement, target_ids }) => ({ action, original, replacement, target_ids })),
     [
@@ -758,7 +772,11 @@ test("a word-order error is found after another clause on the same physical line
     word("w1", "they", 10), word("w2", "study", 80), word("w3", "hard", 150),
     word("w4", "Likes", 230), word("w5", "he", 310), word("w6", "football", 370)
   ];
-  const corrections = detectDeterministicGrammar(words);
+  const groups = [
+    { id: "g1", words: words.slice(0, 3) },
+    { id: "g2", words: words.slice(3) }
+  ];
+  const corrections = detectDeterministicGrammar(words, groups);
   const rewrite = corrections.find((item) => item.action === "rewrite_line");
   assert.deepEqual(rewrite.target_ids, ["w4", "w5"]);
   assert.equal(rewrite.replacement, "He likes");
@@ -969,6 +987,14 @@ test("a real first name mid-sentence is never lowercased even when it looks like
   const group = sentence(["My", "brother", "Mark", "called", "me"])[0];
   const corrections = detectCapitalizationErrors([group]);
   assert.equal(corrections.length, 0);
+});
+
+test("a real first name written lowercase mid-sentence is capitalized", () => {
+  const group = sentence(["My", "friend", "sarah", "called", "yesterday"])[0];
+  const corrections = detectCapitalizationErrors([group]);
+  assert.deepEqual(corrections.map((item) => ({ target_id: item.target_id, replacement: item.replacement })), [
+    { target_id: "s2", replacement: "Sarah" }
+  ]);
 });
 
 test("a sentence's own first word is capitalized when OCR reads it lowercase", () => {

@@ -999,7 +999,8 @@ function normalizeGeminiEdits(group, edits) {
 
 function normalizeGeminiPunctuation(group, punctuation) {
   if (!Array.isArray(punctuation)) return [];
-  const ids = new Set(group.words.map((word) => word.id));
+  const wordById = new Map(group.words.map((word) => [word.id, word]));
+  const ids = new Set(wordById.keys());
   const lastWordId = group.words.length ? group.words[group.words.length - 1].id : undefined;
   const sentenceEndingMarks = new Set([".", "!", "?", "..."]);
   const normalized = [];
@@ -1011,8 +1012,11 @@ function normalizeGeminiPunctuation(group, punctuation) {
     // and flagging every debatable spot as an "error" buries the handful of
     // corrections that matter under dozens that do not. The prompt already
     // asks the model not to add one, but do not rely on that alone: refuse
-    // a comma here unconditionally, whatever the model returns.
-    if (entry.mark === ",") continue;
+    // a comma here unconditionally, whatever the model returns. This cuts
+    // both ways - a comma the student already wrote correctly must not be
+    // stripped out either, so an explicit removal (mark "") is rejected
+    // here too when it targets a word that already carries a comma.
+    if (entry.mark === "," || (entry.mark === "" && wordById.get(entry.after_id)?.punct === ",")) continue;
     // A group is exactly one logical sentence, so a sentence-ending mark can
     // only be correct at the group's own last word - anywhere else it would
     // terminate the sentence mid-clause. Gemini occasionally misplaces one
@@ -1821,7 +1825,7 @@ function isAnyVerbWord(word) {
   return getWordTags(word).includes("Verb");
 }
 
-function frontedVerbPronounCorrections(tokens, index) {
+function frontedVerbPronounCorrections(tokens, index, sentenceStartIds) {
   const verbWord = tokens[index];
   const pronounWord = tokens[index + 1];
   const previousWord = tokens[index - 1];
@@ -1858,9 +1862,15 @@ function frontedVerbPronounCorrections(tokens, index) {
     }
     return corrections;
   }
-  const subject = /^[A-Z]/.test(verbWord.text)
+  // Whether the verb happens to be OCR-capitalized is not a reliable signal
+  // for whether it truly opens a sentence: OCR sometimes capitalizes the
+  // first word of a new physical LINE even mid-sentence (a line-wrap
+  // artifact), which would wrongly capitalize the relocated subject too.
+  // A sentence group's own first word is the authoritative signal instead.
+  const isTrueSentenceStart = sentenceStartIds.has(verbWord.id);
+  const subject = isTrueSentenceStart
     ? pronounWord.text.charAt(0).toUpperCase() + pronounWord.text.slice(1)
-    : pronounWord.text;
+    : pronounWord.text.toLowerCase();
   // A single rewrite_line covering both words (rather than two independent
   // replace corrections) makes the swap atomic: if either word is already
   // claimed by a more specific correction (e.g. a tense fix on the verb
@@ -1882,6 +1892,7 @@ function detectDeterministicGrammar(words, sentenceGroups = []) {
   const linkingVerbs = new Set(["am", "is", "are", "was", "were"]);
   const corrections = [];
   const frontedVerbCorrections = [];
+  const sentenceStartIds = new Set(sentenceGroups.map((group) => group.words?.[0]?.id).filter(Boolean));
   const subjectPronouns = new Set(["he", "she", "it", "we", "they", "you", "i"]);
 
   // Geometry fallback for introductions. It does not depend on sentence
@@ -1915,7 +1926,7 @@ function detectDeterministicGrammar(words, sentenceGroups = []) {
 
     for (let index = 0; index <= tokens.length - 3; index += 1) {
       if (!isFrontableLexicalVerb(normalized[index]) || !subjectPronouns.has(normalized[index + 1])) continue;
-      frontedVerbCorrections.push(...frontedVerbPronounCorrections(tokens, index));
+      frontedVerbCorrections.push(...frontedVerbPronounCorrections(tokens, index, sentenceStartIds));
     }
 
     // The same fronted-verb mistake also happens with a short noun-phrase
@@ -2091,7 +2102,7 @@ function detectDeterministicGrammar(words, sentenceGroups = []) {
     const groupNormalized = groupTokens.map((word) => word.text.toLowerCase().replace(/[^a-z0-9']/g, ""));
     for (let index = 0; index < groupTokens.length - 1; index += 1) {
       if (!isFrontableLexicalVerb(groupNormalized[index]) || !subjectPronouns.has(groupNormalized[index + 1])) continue;
-      frontedVerbCorrections.push(...frontedVerbPronounCorrections(groupTokens, index));
+      frontedVerbCorrections.push(...frontedVerbPronounCorrections(groupTokens, index, sentenceStartIds));
     }
   }
 
@@ -2369,8 +2380,20 @@ function detectCapitalizationErrors(sentenceGroups) {
         return;
       }
       const plain = word.text.replace(/[^A-Za-z']/g, "");
-      if (!/^[A-Z][a-z']*$/.test(plain)) return;
       const lower = plain.toLowerCase();
+      if (/^[a-z']+$/.test(plain) && getWordTags(lower).includes("FirstName")) {
+        // A real first name is always capitalized, wherever it falls in the
+        // sentence, regardless of how the student wrote it - checked via
+        // the same dictionary lookup (word tagged alone) already used
+        // elsewhere, so an ordinary word that only coincidentally shares a
+        // name's spelling in some other context is not touched.
+        corrections.push(makeReplace(
+          word, plain.charAt(0).toUpperCase() + plain.slice(1),
+          `“${word.text}” is a person's name, and names are always capitalized.`
+        ));
+        return;
+      }
+      if (!/^[A-Z][a-z']*$/.test(plain)) return;
       if (lower === "i") return;
       // Beyond the fixed function-word list, a word the dictionary tags as
       // an ordinary present-tense lexical verb (checked on its own, not in
