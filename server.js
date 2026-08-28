@@ -2503,6 +2503,18 @@ function detectCapitalizationErrors(sentenceGroups) {
         ));
         return;
       }
+      if (/^[a-z']+$/.test(plain) && getWordTags(lower).includes("Place")) {
+        // Same idea for a city, country, or other place name (London,
+        // Paris, Turkey). A place name that happens to double as an
+        // ordinary word in another sense (e.g. "turkey" the bird) is a
+        // rarer, accepted risk here - the same tradeoff already made for a
+        // person's name like "Grace" also being the common noun.
+        corrections.push(makeReplace(
+          word, plain.charAt(0).toUpperCase() + plain.slice(1),
+          `“${word.text}” is a place name, and place names are always capitalized.`
+        ));
+        return;
+      }
       if (!/^[A-Z][a-z']*$/.test(plain)) return;
       if (lower === "i") return;
       // Beyond the fixed function-word list, a word the dictionary tags as

@@ -1080,6 +1080,14 @@ test("a real first name written lowercase mid-sentence is capitalized", () => {
   ]);
 });
 
+test("a real place name written lowercase mid-sentence is capitalized", () => {
+  const group = sentence(["We", "are", "going", "to", "london", "next", "week"])[0];
+  const corrections = detectCapitalizationErrors([group]);
+  assert.deepEqual(corrections.map((item) => ({ target_id: item.target_id, replacement: item.replacement })), [
+    { target_id: "s4", replacement: "London" }
+  ]);
+});
+
 test("a sentence's own first word is capitalized when OCR reads it lowercase", () => {
   const group = sentence(["my", "coach", "insisted"])[0];
   const corrections = detectCapitalizationErrors([group]);
