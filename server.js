@@ -168,13 +168,29 @@ async function correctLetter(req, res) {
         languageToolFailures.push({ id: group.id, error: error.message });
         validated = modelResult.corrected;
       }
-      // Gemini'nin OCR-ID tabanlı minimal editlerini LanguageTool'un bütün
-      // cümleyi yeniden yazmasıyla ezmeyelim. LanguageTool, Gemini hiç edit
-      // üretemediyse veya yedek akış çalıştıysa güvenli son kontrol olur.
-      const geminiCorrections = correctionsFromGeminiEdits(group, modelResult.edits, modelResult.corrected)
-        || diffLineToCorrections(group, modelResult.corrected);
+      // Gemini'nin OCR-ID tabanlı editleri şimdiye kadar sadece kendi
+      // ürettiği "corrected" cümlesini birebir yeniden kurup kurmadığına
+      // göre doğrulanıyordu - yani Gemini'nin kendi cümlesi iç tutarlı olsa
+      // bile hâlâ hatalı kalmış olabilir (örn. "to home I turned" ->
+      // "returned home I turned" gibi, yanlış kelimeyi değiştirip asıl
+      // hatalı kelimeyi olduğu gibi bırakmak). LanguageTool, Gemini'nin
+      // kendi "corrected" cümlesini bağımsız olarak tekrar kontrol ediyor;
+      // hâlâ (noktalama/büyük harf dışında) bir şey değiştiriyorsa, bu
+      // Gemini'nin düzeltmesinin eksik kaldığının genel bir işareti -
+      // sadece bu örnekte değil, Gemini'nin dar kapsamlı bir düzeltmeyle
+      // cümlenin geri kalanını hatalı bıraktığı her durumda. Bu durumda
+      // Gemini'nin minimal editlerine güvenmek yerine LanguageTool'un daha
+      // tamamlanmış halinden diff ile düzeltme üretiyoruz. Gemini'nin
+      // cümlesi zaten LanguageTool'u da tatmin ediyorsa (çoğu durum), eski
+      // davranış aynen sürüyor: LanguageTool'un daha geniş kapsamlı yeniden
+      // yazımı, Gemini'nin dar ID tabanlı editlerini ezmiyor.
+      const correctedIsFullyValidated = validated === modelResult.corrected;
+      const geminiCorrections = correctedIsFullyValidated
+        ? (correctionsFromGeminiEdits(group, modelResult.edits, modelResult.corrected)
+          || diffLineToCorrections(group, modelResult.corrected))
+        : null;
       const punctuation = modelResult.punctuation || [];
-      if (geminiCorrections.length) return { corrections: geminiCorrections, punctuation };
+      if (geminiCorrections && geminiCorrections.length) return { corrections: geminiCorrections, punctuation };
       return { corrections: diffLineToCorrections(group, validated), punctuation };
     });
     const corrections = correctionGroups.flatMap((item) => item.corrections);

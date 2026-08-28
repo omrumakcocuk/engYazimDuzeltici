@@ -6,3 +6,4 @@ node_modules/
 .venv/
 npm-debug.log*
 debug_last_corrections.json
+debug_raw_words.json
