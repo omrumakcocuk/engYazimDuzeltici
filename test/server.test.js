@@ -16,6 +16,7 @@ const {
   isApostropheOnlyFix,
   sanitizeCorrectionCapitalization,
   sanitizeModelCapitalization,
+  buildPunctuationCorrections,
   filterProtectedProperNames,
   filterUnrenderableCorrections,
   groupOcrWordsIntoLines,
@@ -749,12 +750,96 @@ test("sanitizeCorrectionCapitalization only touches replace/rewrite_line replace
   ]);
 });
 
+test("a missing question mark is drawn on the photo as an insert anchored on the last word", () => {
+  const words = ["Are", "you", "coming", "today", "Yes"].map((text, index) => word(`w${index}`, text, index * 80));
+  const groups = [
+    { id: "g1", words: words.slice(0, 4) },
+    { id: "g2", words: words.slice(4) }
+  ];
+  const punctuationByWordId = new Map([["w3", "?"]]);
+  const corrections = buildPunctuationCorrections(words, groups, punctuationByWordId);
+  assert.deepEqual(corrections, [{
+    action: "insert",
+    original: "",
+    replacement: "?",
+    reason: "This sentence is a question, so it should end with a question mark.",
+    target_id: "",
+    left_id: "w3",
+    right_id: "w4"
+  }]);
+});
+
+test("a missing mark at the very end of the letter (no next word) is a trailing insert with no right anchor", () => {
+  const words = ["I", "am", "tired"].map((text, index) => word(`w${index}`, text, index * 80));
+  const groups = [{ id: "g1", words }];
+  const punctuationByWordId = new Map([["w2", "."]]);
+  const corrections = buildPunctuationCorrections(words, groups, punctuationByWordId);
+  assert.deepEqual(corrections, [{
+    action: "insert",
+    original: "",
+    replacement: ".",
+    reason: "Every sentence ends with a punctuation mark.",
+    target_id: "",
+    left_id: "w2",
+    right_id: ""
+  }]);
+});
+
+test("a wrong existing mark is replaced on the photo as a whole word+mark redraw, since OCR gives it no separate box to erase alone", () => {
+  const words = ["Really", "yes"].map((text, index) => word(`w${index}`, text, index * 80));
+  words[0].punct = "?";
+  const groups = [{ id: "g1", words }];
+  const punctuationByWordId = new Map([["w0", "."]]);
+  assert.deepEqual(buildPunctuationCorrections(words, groups, punctuationByWordId), [{
+    action: "replace",
+    original: "Really?",
+    replacement: "Really.",
+    reason: "Every sentence ends with a punctuation mark.",
+    target_id: "w0", left_id: "", right_id: ""
+  }]);
+});
+
+test("a mark that is already correct is left alone even if word.punct happens to match it", () => {
+  const words = ["Really", "yes"].map((text, index) => word(`w${index}`, text, index * 80));
+  words[0].punct = ".";
+  const groups = [{ id: "g1", words }];
+  const punctuationByWordId = new Map([["w0", "."]]);
+  assert.deepEqual(buildPunctuationCorrections(words, groups, punctuationByWordId), []);
+});
+
 test("a determiner right before a noun-verb-ambiguous word means it is a noun, not a fronted verb missing a subject", () => {
   const words = ["to", "the", "market", "I", "was", "going"]
     .map((text, index) => word(`w${index}`, text, index * 80));
   const group = { id: "g1", words };
   const corrections = detectDeterministicGrammar(words, [group]);
   assert.deepEqual(corrections, []);
+});
+
+test("a fronted-subject determiner rewrite only fires on the true sentence start, not a physical line wrap mid-sentence", () => {
+  const words = ["Then", "we", "went", "to", "Paris", "to", "visit", "our", "friend", "Ahmet"]
+    .map((text, index) => word(`w${index}`, text, index * 80));
+  const group = { id: "g1", words };
+  assert.deepEqual(detectDeterministicGrammar(words, [group]), []);
+});
+
+test("an infinitive 'to' before a verb is never mistaken for a fronted-verb inversion", () => {
+  const words = ["She", "wants", "to", "visit", "her", "friend"]
+    .map((text, index) => word(`w${index}`, text, index * 80));
+  const group = { id: "g1", words };
+  assert.deepEqual(
+    detectDeterministicGrammar(words, [group]).filter((item) => (item.target_ids || []).includes("w3")),
+    []
+  );
+});
+
+test("a genuine fronted-verb noun-phrase subject is still reordered when it truly opens the sentence", () => {
+  const words = ["Enjoys", "my", "father", "fishing", "every", "weekend"]
+    .map((text, index) => word(`w${index}`, text, index * 80));
+  const group = { id: "g1", words };
+  const correction = detectDeterministicGrammar(words, [group]).find((item) => item.action === "rewrite_line");
+  assert.ok(correction);
+  assert.deepEqual(correction.target_ids, ["w0", "w1", "w2"]);
+  assert.equal(correction.replacement, "My father enjoys");
 });
 
 test("the typed transcript drops wrong words entirely and marks only the correction red", () => {
@@ -1396,6 +1481,24 @@ test("a third-person preference verb also pluralizes a general count noun", () =
   ];
   const correction = detectDeterministicGrammar(words).find((item) => item.target_id === "w4");
   assert.equal(correction.replacement, "stories");
+});
+
+test("singular/plural subject-verb agreement now generalizes to any ordinary verb, not just a fixed 8-word list", () => {
+  const walk = detectDeterministicGrammar([word("w1", "he", 10), word("w2", "walk", 90), word("w3", "home", 180)]);
+  assert.equal(walk.find((item) => item.target_id === "w2")?.replacement, "walks");
+
+  const doesntWalks = detectDeterministicGrammar([
+    word("w1", "he", 10), word("w2", "doesnt", 90), word("w3", "walks", 190), word("w4", "home", 280)
+  ]);
+  assert.equal(doesntWalks.find((item) => item.target_id === "w3")?.replacement, "walk");
+
+  const theyPlays = detectDeterministicGrammar([word("w1", "they", 10), word("w2", "plays", 90), word("w3", "football", 190)]);
+  assert.equal(theyPlays.find((item) => item.target_id === "w2")?.replacement, "play");
+});
+
+test("a modal after he/she/it is never conjugated as if it were an ordinary verb", () => {
+  const words = [word("w1", "he", 10), word("w2", "can", 90), word("w3", "swim", 180)];
+  assert.equal(detectDeterministicGrammar(words).some((item) => item.target_id === "w2"), false);
 });
 
 test("an article keeps a singular activity noun valid", () => {

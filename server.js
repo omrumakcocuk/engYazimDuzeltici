@@ -220,7 +220,18 @@ async function correctLetter(req, res) {
     ).map(trimRewriteToChangedSpan);
 
     const transcript = buildCorrectionTranscript(sentenceGroups, finalCorrections, punctuationByWordId);
-    const { renderable: renderableCorrections, dropped: unrenderableCount } = filterUnrenderableCorrections(finalCorrections, words);
+    // Punctuation marks are merged in only for the photo, never the
+    // transcript above: the transcript already renders them precisely via
+    // punctuationByWordId (tied to the word, not colouring it), and folding
+    // this list into finalCorrections would make that render a second,
+    // duplicate mark as if it were a missing word. Running it back through
+    // mergeCorrections after finalCorrections is already settled still
+    // drops a mark whose anchor word was claimed by a higher-priority
+    // rewrite - the same conflict check runs again, just against a second,
+    // lower-priority group appended afterward.
+    const punctuationRenderCorrections = buildPunctuationCorrections(words, sentenceGroups, punctuationByWordId);
+    const photoCorrections = mergeCorrections(finalCorrections, punctuationRenderCorrections);
+    const { renderable: renderableCorrections, dropped: unrenderableCount } = filterUnrenderableCorrections(photoCorrections, words);
     const anchoredCorrections = attachOcrAnchors(renderableCorrections, words);
     if (process.env.DEBUG_CORRECTIONS) {
       try {
@@ -1687,7 +1698,11 @@ function filterUnrenderableCorrections(corrections, words) {
     }
     if (correction.action === "insert") {
       const leftLine = lineIndexById.get(correction.left_id);
-      const rightLine = lineIndexById.get(correction.right_id);
+      // A trailing insert (a sentence-ending mark with no next word on the
+      // same physical line, e.g. the very last sentence in the letter) is
+      // deliberately anchored with no right_id at all - only a genuine,
+      // resolvable right anchor needs to share the left one's line.
+      const rightLine = correction.right_id ? lineIndexById.get(correction.right_id) : leftLine;
       if (leftLine === undefined || leftLine !== rightLine) {
         console.warn("Farkli fiziksel satirlar arasindaki ekleme atlandi:", correction.replacement);
         dropped += 1;
@@ -1770,6 +1785,71 @@ function makeReplace(word, replacement, reason) {
     reason: reason || (replacement ? `Replace “${word.text}” with “${replacement}”.` : `Remove “${word.text}”.`),
     target_id: word.id, left_id: "", right_id: ""
   };
+}
+
+function punctuationReason(mark) {
+  if (mark === "?") return "This sentence is a question, so it should end with a question mark.";
+  if (mark === "!") return "This sentence is an exclamation, so it should end with an exclamation mark.";
+  return "Every sentence ends with a punctuation mark.";
+}
+
+// A missing or wrong sentence-ending mark is drawn onto the photo itself,
+// separately from the typed transcript (which already renders punctuation
+// precisely via punctuationByWordId, tying the mark to its word without
+// coloring the word itself - see buildCorrectionTranscript). This list must
+// therefore never be folded into the corrections passed to that function;
+// it exists only to be merged into the photo-only correction list, or the
+// transcript would show every mark twice.
+//
+// Two shapes come out of this:
+//   - Missing entirely (word.punct is empty): an "insert" anchored right
+//     after the word, exactly like a missing word - erasure-free, since
+//     there is no existing ink to remove.
+//   - An existing mark that needs to change or disappear (word.punct is
+//     already set): a "replace" covering the word plus its mark together,
+//     which erases and redraws that whole span. OCR never gives a
+//     punctuation mark its own bounding box separate from the word it
+//     rides on (a mark can even be a fully separate OCR token nearby - see
+//     parseGoogleVisionWords), so there is no way to erase just the mark's
+//     ink on its own; redrawing the word alongside it is the trade-off.
+function buildPunctuationCorrections(words, sentenceGroups, punctuationByWordId) {
+  if (!punctuationByWordId.size) return [];
+  const lineIndexById = new Map();
+  groupOcrWordsIntoLines(words).forEach((line, lineIndex) => {
+    line.words.forEach((word) => lineIndexById.set(word.id, lineIndex));
+  });
+  const corrections = [];
+  sentenceGroups.forEach((group, groupIndex) => {
+    const groupWords = group.words || [];
+    groupWords.forEach((word, index) => {
+      if (!punctuationByWordId.has(word.id)) return;
+      const mark = punctuationByWordId.get(word.id);
+      if (mark === word.punct) return;
+      if (word.punct) {
+        corrections.push({
+          action: "replace",
+          original: word.text + word.punct,
+          replacement: word.text + mark,
+          reason: punctuationReason(mark),
+          target_id: word.id, left_id: "", right_id: ""
+        });
+        return;
+      }
+      if (!mark) return;
+      const nextWord = groupWords[index + 1] || sentenceGroups[groupIndex + 1]?.words?.[0] || null;
+      const sameLine = nextWord && lineIndexById.get(nextWord.id) === lineIndexById.get(word.id);
+      corrections.push({
+        action: "insert",
+        original: "",
+        replacement: mark,
+        reason: punctuationReason(mark),
+        target_id: "",
+        left_id: word.id,
+        right_id: sameLine ? nextWord.id : ""
+      });
+    });
+  });
+  return corrections;
 }
 
 function makeInsert(left, right, replacement, reason) {
@@ -1975,6 +2055,39 @@ function isAnyVerbWord(word) {
   // a bogus extra pronoun before an ordinary gerund object.
   return tags.includes("Verb") && !tags.includes("Gerund");
 }
+const verbConjugationCache = new Map();
+function conjugateVerb(word) {
+  if (!word || !/^[a-z']+$/.test(word)) return null;
+  if (verbConjugationCache.has(word)) return verbConjugationCache.get(word);
+  const result = nlp(word).verbs().conjugate();
+  const conjugation = result && result.length ? result[0] : null;
+  verbConjugationCache.set(word, conjugation);
+  return conjugation;
+}
+// Generalizes what used to be two fixed 8-verb lookup maps: any ordinary
+// lexical verb - not just the handful that happened to be hardcoded - can
+// follow "he/she/it" (needs its -s form) or a negative auxiliary like
+// "doesn't" (needs its base form back). Modals/auxiliaries (can, will,
+// must...) conjugate to nonsense forms ("cans", "musts") if fed through
+// here, so they are excluded the same way isFrontableLexicalVerb already
+// excludes them elsewhere in this file, and Person/ProperNoun is excluded
+// for the same reason it is there too (a name spelled like a verb).
+function thirdPersonSingularForm(baseWord) {
+  if (AUXILIARY_OR_COPULA_VERBS.has(baseWord)) return null;
+  const tags = getWordTags(baseWord);
+  if (!tags.includes("Verb") || tags.includes("Person") || tags.includes("ProperNoun")) return null;
+  const conjugation = conjugateVerb(baseWord);
+  if (!conjugation || conjugation.Infinitive !== baseWord || !conjugation.PresentTense) return null;
+  return conjugation.PresentTense;
+}
+function baseVerbForm(presentWord) {
+  if (AUXILIARY_OR_COPULA_VERBS.has(presentWord)) return null;
+  const tags = getWordTags(presentWord);
+  if (!tags.includes("Verb") || tags.includes("Person") || tags.includes("ProperNoun")) return null;
+  const conjugation = conjugateVerb(presentWord);
+  if (!conjugation || conjugation.PresentTense !== presentWord || !conjugation.Infinitive) return null;
+  return conjugation.Infinitive;
+}
 
 function frontedVerbPronounCorrections(tokens, index, sentenceStartIds) {
   const verbWord = tokens[index];
@@ -1998,9 +2111,14 @@ function frontedVerbPronounCorrections(tokens, index, sentenceStartIds) {
     // homographs the tagger reads as a verb by default when judged alone
     // ("market", "play", "walk"), but "the market I was going" is a
     // determiner introducing a noun phrase, not a fronted verb - "I" is
-    // already the subject of "was going" a few words later.
+    // already the subject of "was going" a few words later. The infinitive
+    // marker "to" is yet another disguise for the same thing: "to visit our
+    // friend" is a normal infinitive clause (the verb's subject is whoever
+    // is doing the visiting, established elsewhere in the sentence), not a
+    // fronted "our friend visit".
     if (previousTags.includes("Noun") || previousTags.includes("Pronoun")
-      || previousTags.includes("Determiner") || AUXILIARY_OR_COPULA_VERBS.has(previousNormalized)) return [];
+      || previousTags.includes("Determiner") || previousNormalized === "to"
+      || AUXILIARY_OR_COPULA_VERBS.has(previousNormalized)) return [];
   }
   const nextWord = tokens[index + 2];
   const nextNormalized = nextWord ? nextWord.text.toLowerCase().replace(/[^a-z0-9']/g, "") : "";
@@ -2028,8 +2146,14 @@ function frontedVerbPronounCorrections(tokens, index, sentenceStartIds) {
   // for whether it truly opens a sentence: OCR sometimes capitalizes the
   // first word of a new physical LINE even mid-sentence (a line-wrap
   // artifact), which would wrongly capitalize the relocated subject too.
-  // A sentence group's own first word is the authoritative signal instead.
-  const isTrueSentenceStart = sentenceStartIds.has(verbWord.id);
+  // A sentence group's own first word is the authoritative signal instead -
+  // but when there is no group data at all (a caller that never passes
+  // sentenceGroups), sentenceStartIds is empty and has no opinion either
+  // way, so OCR's own capitalization is the only signal left and is trusted
+  // the same way it always was before groups existed.
+  const isTrueSentenceStart = sentenceStartIds.size
+    ? sentenceStartIds.has(verbWord.id)
+    : /^[A-Z]/.test(verbWord.text);
   const subject = isTrueSentenceStart
     ? pronounWord.text.charAt(0).toUpperCase() + pronounWord.text.slice(1)
     : pronounWord.text.toLowerCase();
@@ -2064,6 +2188,45 @@ function frontedVerbPronounCorrections(tokens, index, sentenceStartIds) {
     "Add the missing subject before the verb."
   );
   return [insertCorrection, swapCorrection];
+}
+
+// Same fronted-verb mistake as frontedVerbPronounCorrections, but with a
+// short noun-phrase subject ("determiner noun") instead of a bare pronoun -
+// "Enjoys my father fishing" instead of "My father enjoys fishing". Shares
+// the same "does the verb already have a subject" guard: an ordinary verb
+// immediately preceded by a noun/pronoun/determiner/auxiliary already has
+// one, so "to visit our friend" is a normal infinitive object clause, not a
+// fronted "our friend visit" needing a swap - only a genuinely subjectless
+// verb at this position is a real inversion.
+function frontedVerbDeterminerCorrection(tokens, index, sentenceStartIds) {
+  const verbWord = tokens[index];
+  const detWord = tokens[index + 1];
+  const nounWord = tokens[index + 2];
+  const previousWord = tokens[index - 1];
+  if (previousWord) {
+    const previousNormalized = previousWord.text.toLowerCase().replace(/[^a-z0-9']/g, "");
+    const previousTags = getWordTags(previousNormalized);
+    if (previousTags.includes("Noun") || previousTags.includes("Pronoun")
+      || previousTags.includes("Determiner") || previousNormalized === "to"
+      || AUXILIARY_OR_COPULA_VERBS.has(previousNormalized)) return null;
+  }
+  // Whether the verb happens to be OCR-capitalized is not a reliable signal
+  // for whether it truly opens a sentence - see the identical reasoning in
+  // frontedVerbPronounCorrections, including the no-group-data fallback.
+  const isTrueSentenceStart = sentenceStartIds.size
+    ? sentenceStartIds.has(verbWord.id)
+    : /^[A-Z]/.test(verbWord.text);
+  const detText = isTrueSentenceStart
+    ? detWord.text.charAt(0).toUpperCase() + detWord.text.slice(1)
+    : detWord.text.toLowerCase();
+  return {
+    action: "rewrite_line",
+    original: `${verbWord.text} ${detWord.text} ${nounWord.text}`,
+    replacement: `${detText} ${nounWord.text} ${verbWord.text.toLowerCase()}`,
+    reason: "Move the subject before the verb; a statement should not start with the verb.",
+    target_ids: [verbWord.id, detWord.id, nounWord.id],
+    target_id: "", left_id: "", right_id: ""
+  };
 }
 
 function detectDeterministicGrammar(words, sentenceGroups = [], punctuationByWordId = new Map()) {
@@ -2172,33 +2335,25 @@ function detectDeterministicGrammar(words, sentenceGroups = [], punctuationByWor
     // "My father enjoys fishing"). Only the narrow determiner+noun shape is
     // matched (not arbitrary multi-word subjects) so this cannot misfire on
     // an object noun phrase that happens to follow the verb normally.
-    const subjectDeterminers = new Set([
-      "my", "his", "her", "our", "your", "their", "the", "a", "an"
-    ]);
-    for (let index = 0; index <= tokens.length - 4; index += 1) {
-      // Unlike the pronoun case above, "verb + determiner + noun" is a
-      // completely ordinary object phrase in the middle of a sentence ("He
-      // enjoys the reptile house"), so this only applies when the verb opens
-      // the line - that is the shape that is actually always wrong.
-      if (index !== 0) continue;
-      if (!isFrontableLexicalVerb(normalized[index])) continue;
-      if (!subjectDeterminers.has(normalized[index + 1])) continue;
-      if (!/^[a-z']+$/.test(normalized[index + 2] || "")) continue;
-      if (!wordsShareSentence(tokens[index], tokens[index + 1]) || !wordsShareSentence(tokens[index + 1], tokens[index + 2])) continue;
-      const verbWord = tokens[index];
-      const detWord = tokens[index + 1];
-      const nounWord = tokens[index + 2];
-      const detText = /^[A-Z]/.test(verbWord.text)
-        ? detWord.text.charAt(0).toUpperCase() + detWord.text.slice(1)
-        : detWord.text;
-      corrections.push({
-        action: "rewrite_line",
-        original: `${verbWord.text} ${detWord.text} ${nounWord.text}`,
-        replacement: `${detText} ${nounWord.text} ${verbWord.text.toLowerCase()}`,
-        reason: "Move the subject before the verb; a statement should not start with the verb.",
-        target_ids: [verbWord.id, detWord.id, nounWord.id],
-        target_id: "", left_id: "", right_id: ""
-      });
+    // Same reasoning as the pronoun pass above applies here too: physical-
+    // line-start is not a safe stand-in for true sentence-start once real
+    // sentence-group data exists (a sentence can continue past a line
+    // wrap into a verb like "to visit our friend", which sits at physical
+    // index 0 but is not remotely a fronted subject) - see the group-based
+    // pass further down for the version that is actually correct once
+    // groups are known.
+    if (!groupIdByWordId.size) {
+      const subjectDeterminers = new Set([
+        "my", "his", "her", "our", "your", "their", "the", "a", "an"
+      ]);
+      for (let index = 0; index <= tokens.length - 4; index += 1) {
+        if (index !== 0) continue;
+        if (!isFrontableLexicalVerb(normalized[index])) continue;
+        if (!subjectDeterminers.has(normalized[index + 1])) continue;
+        if (!/^[a-z']+$/.test(normalized[index + 2] || "")) continue;
+        const correction = frontedVerbDeterminerCorrection(tokens, index, sentenceStartIds);
+        if (correction) corrections.push(correction);
+      }
     }
 
     // Keep these high-confidence agreement checks local to one physical line.
@@ -2206,16 +2361,6 @@ function detectDeterministicGrammar(words, sentenceGroups = [], punctuationByWor
     // one line from changing a verb on another line.
     const singularPronouns = new Set(["he", "she", "it"]);
     const pluralPronouns = new Set(["we", "they", "you"]);
-    const singularPreference = new Map([
-      ["like", "likes"], ["love", "loves"], ["enjoy", "enjoys"],
-      ["prefer", "prefers"], ["play", "plays"], ["read", "reads"],
-      ["watch", "watches"], ["study", "studies"]
-    ]);
-    const baseAfterAuxiliary = new Map([
-      ["likes", "like"], ["loves", "love"], ["enjoys", "enjoy"],
-      ["prefers", "prefer"], ["plays", "play"], ["reads", "read"],
-      ["watches", "watch"], ["studies", "study"]
-    ]);
     // A question auxiliary or modal directly before the subject already
     // carries the verb's person/number, so the main verb after the subject
     // stays in its base form ("Does he play?", "Can he play?") - unlike a
@@ -2232,8 +2377,10 @@ function detectDeterministicGrammar(words, sentenceGroups = [], punctuationByWor
       if (singularPronouns.has(previous) && token === "have" && !governedByAuxiliary) {
         corrections.push(makeReplace(tokens[index], "has"));
       }
-      if (singularPronouns.has(previous) && singularPreference.has(token) && !governedByAuxiliary) {
-        corrections.push(makeReplace(tokens[index], singularPreference.get(token)));
+      const singularForm = singularPronouns.has(previous) && !governedByAuxiliary
+        ? thirdPersonSingularForm(token) : null;
+      if (singularForm) {
+        corrections.push(makeReplace(tokens[index], singularForm));
       }
       if (pluralPronouns.has(previous) && token === "was") {
         corrections.push(makeReplace(tokens[index], "were"));
@@ -2243,8 +2390,10 @@ function detectDeterministicGrammar(words, sentenceGroups = [], punctuationByWor
         && token === "were") {
         corrections.push(makeReplace(tokens[index], "was"));
       }
-      if (["doesn't", "doesnt", "don't", "dont"].includes(previous) && baseAfterAuxiliary.has(token)) {
-        corrections.push(makeReplace(tokens[index], baseAfterAuxiliary.get(token)));
+      const baseForm = ["doesn't", "doesnt", "don't", "dont"].includes(previous)
+        ? baseVerbForm(token) : null;
+      if (baseForm) {
+        corrections.push(makeReplace(tokens[index], baseForm));
       }
       // "more better/worse/easier..." is a common double-comparative mistake.
       // Only match a fixed list of known comparative adjectives so an
@@ -2345,6 +2494,28 @@ function detectDeterministicGrammar(words, sentenceGroups = [], punctuationByWor
     }
   }
 
+  // Same idea as the group-based pronoun pass just above, for the
+  // determiner+noun subject shape: a sentence group's own word order
+  // already reflects correct reading order across a physical line wrap,
+  // so this is what actually catches "...to / visit our friend Ahmet"
+  // (where "visit" opens its physical line but is nowhere near its
+  // sentence's start) without the false positive the line-based version
+  // above had before it was restricted to running only without group data.
+  const subjectDeterminers = new Set([
+    "my", "his", "her", "our", "your", "their", "the", "a", "an"
+  ]);
+  for (const group of sentenceGroups) {
+    const groupTokens = group.words || [];
+    const groupNormalized = groupTokens.map((word) => word.text.toLowerCase().replace(/[^a-z0-9']/g, ""));
+    for (let index = 0; index <= groupTokens.length - 3; index += 1) {
+      if (!isFrontableLexicalVerb(groupNormalized[index])) continue;
+      if (!subjectDeterminers.has(groupNormalized[index + 1])) continue;
+      if (!/^[a-z']+$/.test(groupNormalized[index + 2] || "")) continue;
+      const correction = frontedVerbDeterminerCorrection(groupTokens, index, sentenceStartIds);
+      if (correction) corrections.push(correction);
+    }
+  }
+
   const orderedLines = groupOcrWordsIntoLines(words)
     .map((line) => ({ ...line, words: [...line.words].sort((a, b) => a.x - b.x) }));
   const lineIndexByWordId = new Map();
@@ -2387,10 +2558,17 @@ function detectDeterministicGrammar(words, sentenceGroups = [], punctuationByWor
     const visibleVerb = normalizedReading[index + 1];
     if (!new Set(["we", "they", "you"]).has(subject)) continue;
     if (!sharesLogicalGroup(readingOrder[index], readingOrder[index + 1])) continue;
+    // "has"/"does" are irregular and also excluded from baseVerbForm's own
+    // conjugation lookup (there they double as auxiliaries, e.g. "doesn't
+    // have" - a case where the verb after them must NOT be touched), so
+    // they stay their own explicit cases here where they are instead the
+    // sentence's main verb ("they has a dog"). Every other verb - not just
+    // ones ending in "-ies" - goes through the same general conjugation
+    // lookup used for the "he/she/it" agreement checks above.
     let replacement = null;
-    if (/[^aeiou]ies$/.test(visibleVerb)) replacement = `${visibleVerb.slice(0, -3)}y`;
-    else if (visibleVerb === "has") replacement = "have";
+    if (visibleVerb === "has") replacement = "have";
     else if (visibleVerb === "does") replacement = "do";
+    else replacement = baseVerbForm(visibleVerb);
     if (!replacement) continue;
     corrections.push({
       action: "replace",
@@ -3132,6 +3310,7 @@ module.exports = {
   isApostropheOnlyFix,
   sanitizeCorrectionCapitalization,
   sanitizeModelCapitalization,
+  buildPunctuationCorrections,
   filterProtectedProperNames,
   filterUnrenderableCorrections,
   groupOcrWordsIntoLines,
