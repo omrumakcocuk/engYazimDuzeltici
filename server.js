@@ -2683,7 +2683,13 @@ function detectDeterministicGrammar(words, sentenceGroups = [], punctuationByWor
     for (let nounIndex = index + 1; nounIndex < searchEnd; nounIndex += 1) {
       if (lineIndexByWordId.get(readingOrder[nounIndex].id) !== lineIndexByWordId.get(readingOrder[index].id)) break;
       const visibleNoun = normalizedReading[nounIndex];
+      // Same-length-only: an OCR misread swaps one similarly-shaped
+      // character for another ("m2tch" for "match"), it does not add or
+      // drop a whole letter. Without this, "math" (a real, correctly
+      // spelled, uncountable word - not a typo of anything) sat only one
+      // insertion away from "match" and got "corrected" into "matches".
       const singular = [...commonActivityCountNouns]
+        .filter((noun) => noun.length === visibleNoun.length)
         .map((noun) => ({ noun, distance: ocrAwareWordDistance(visibleNoun, noun) }))
         .sort((a, b) => a.distance - b.distance)[0];
       if (!singular || singular.distance > 1) continue;

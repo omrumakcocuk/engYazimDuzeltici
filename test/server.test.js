@@ -1482,6 +1482,14 @@ test("a general preference pluralizes a nearby singular activity noun", () => {
   assert.equal(correction.replacement, "matches");
 });
 
+test("a correctly spelled different word is never mistaken for a nearby OCR-garbled activity noun just because it is one insertion away", () => {
+  const words = [
+    word("w1", "he", 10), word("w2", "doesnt", 70), word("w3", "like", 150),
+    word("w4", "math", 220), word("w5", "very", 300), word("w6", "much", 370)
+  ];
+  assert.equal(detectDeterministicGrammar(words).some((item) => item.target_id === "w4"), false);
+});
+
 test("a third-person preference verb also pluralizes a general count noun", () => {
   const words = [
     word("w1", "She", 10), word("w2", "enjoys", 70), word("w3", "reading", 160),
