@@ -2786,7 +2786,7 @@ const MID_SENTENCE_LOWERCASE_WORDS = new Set([
   "because", "if", "when", "while", "although", "though", "since", "unless",
   "that", "this", "these", "those",
   "some", "any", "every", "each", "all", "both", "few", "many", "several", "most",
-  "other", "another", "either", "neither",
+  "other", "another", "either", "neither", "such",
   "at", "in", "on", "to", "of", "for", "with", "from", "as", "by", "about", "into", "onto",
   "not", "no", "very", "also", "then", "than", "just", "still", "even"
 ]);

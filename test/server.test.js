@@ -1252,6 +1252,14 @@ test("a wrongly capitalized quantifier determiner mid-sentence is lowercased, sa
   ]);
 });
 
+test("'such' is lowercased mid-sentence too, same as the other quantifier determiners", () => {
+  const group = sentence(["My", "teacher", "gave", "us", "Such", "difficult", "homework"])[0];
+  const corrections = detectCapitalizationErrors([group]);
+  assert.deepEqual(corrections.map((item) => ({ target_id: item.target_id, replacement: item.replacement })), [
+    { target_id: "s4", replacement: "such" }
+  ]);
+});
+
 test("a mid-sentence content verb wrongly capitalized is lowercased even with its own subject before it", () => {
   const group = sentence(["My", "brother", "Hopes", "he", "can", "play", "football"])[0];
   const corrections = detectCapitalizationErrors([group]);
