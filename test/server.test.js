@@ -1244,6 +1244,14 @@ test("a capitalized proper name mid-sentence is left alone by the capitalization
   assert.equal(corrections.length, 0);
 });
 
+test("a wrongly capitalized quantifier determiner mid-sentence is lowercased, same as the/a/an already were", () => {
+  const group = sentence(["He", "needed", "Some", "things"])[0];
+  const corrections = detectCapitalizationErrors([group]);
+  assert.deepEqual(corrections.map((item) => ({ target_id: item.target_id, replacement: item.replacement })), [
+    { target_id: "s2", replacement: "some" }
+  ]);
+});
+
 test("a mid-sentence content verb wrongly capitalized is lowercased even with its own subject before it", () => {
   const group = sentence(["My", "brother", "Hopes", "he", "can", "play", "football"])[0];
   const corrections = detectCapitalizationErrors([group]);
