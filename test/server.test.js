@@ -18,6 +18,7 @@ const {
   sanitizeModelCapitalization,
   buildPunctuationCorrections,
   filterProtectedProperNames,
+  isCapitalizationOnlyFix,
   filterUnrenderableCorrections,
   groupOcrWordsIntoLines,
   isSafeCorrection,
@@ -1227,6 +1228,22 @@ test("a phrase rewrite cannot erase a protected proper name", () => {
     target_ids: ["w3", "w4"]
   }];
   assert.deepEqual(filterProtectedProperNames(corrections, groups), []);
+});
+
+test("a capitalization-only fix from the model is never blocked as a possible protected name", () => {
+  const groups = [{ words: [word("w1", "I", 10), word("w2", "saw", 60), word("w3", "a", 130), word("w4", "new", 170), word("w5", "Car", 230)] }];
+  const corrections = [
+    { action: "replace", target_id: "w5", original: "Car", replacement: "car" }
+  ];
+  assert.deepEqual(filterProtectedProperNames(corrections, groups).map((item) => item.target_id), ["w5"]);
+});
+
+test("isCapitalizationOnlyFix only matches a pure case change, not a real content change", () => {
+  assert.equal(isCapitalizationOnlyFix("Car", "car"), true);
+  assert.equal(isCapitalizationOnlyFix("Car", "car"), true);
+  assert.equal(isCapitalizationOnlyFix("Car", "Cars"), false);
+  assert.equal(isCapitalizationOnlyFix("Car", "Car"), false);
+  assert.equal(isCapitalizationOnlyFix("", "car"), false);
 });
 
 test("a mid-sentence function word wrongly capitalized is lowercased", () => {

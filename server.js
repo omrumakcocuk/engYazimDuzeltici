@@ -927,7 +927,7 @@ function correctionInstructions() {
     "Check B1-B2 structures explicitly: conditionals, comparative forms, relative clauses, reported speech, tense consistency, gerunds and infinitives, and redundant conjunctions such as Although ... but.",
     "Respect the logical sentence boundaries supplied in the OCR token sequence even when the photograph has no punctuation.",
     "Enforce grammatical parallelism between coordinated activities; verbs joined by and/or must use compatible forms.",
-    "Ignore capitalization-only issues. Preserve every proper noun exactly as visibly written.",
+    "Leave the group's own first letter and the pronoun \"I\" exactly as given - a separate process already handles sentence-initial capitalization. Preserve every genuine proper noun (a person's name, a place, a brand, a holiday, an organization, a nationality, a language, a day, a month) exactly as visibly written, capitalized or not, even if you are not fully certain it qualifies - when in doubt, leave it alone. The one capitalization mistake worth fixing as a normal edit is an ordinary common noun or other everyday word capitalized in the middle of the sentence for no grammatical reason (for example \"I saw a new Car\" - \"Car\" is not a proper noun here and should be lowercase).",
     "Some OCR tokens already carry trailing punctuation exactly as handwritten (a comma, period, question mark, exclamation mark, or ellipsis printed right after the token with no space). The only punctuation edit you are allowed to make is adding a single sentence-ending period, question mark, or exclamation mark where the group's own final word currently has none, or fixing a mark that is factually wrong for that position (for example a comma sitting where the sentence has clearly already ended). Never add a comma anywhere - not before 'and', 'but', 'or', 'so', 'because', or any other conjunction, not after an introductory word or phrase, not around a clause. This holds even where a formal style guide would normally want one: this student's sentences without any internal commas are not an error and must not be touched. The punctuation array must therefore only ever contain entries whose mark is \".\", \"!\", \"?\", \"...\", or \"\" - never \",\".",
     "Return every punctuation change as its own entry in the punctuation array: after_id is the OCR word ID that the mark should immediately follow once corrected, and mark is exactly one of \",\" \".\" \"!\" \"?\" \"...\" or an empty string to mean no punctuation should follow that word. Only include an entry when the correct mark differs from what that token already carries; leave punctuation exactly as given everywhere else. Use an empty punctuation array when nothing needs to change.",
     "Use American English consistently. Convert British spellings to their standard American forms when they differ.",
@@ -1261,6 +1261,18 @@ function ocrAwareWordDistance(left, right) {
   return matrix[left.length][right.length];
 }
 
+// A fix whose only change is letter case ("School" -> "school") is exactly
+// the kind of correction filterProtectedProperNames must let through rather
+// than block: the model was asked to only touch capitalization when a word
+// is definitely NOT a proper noun (see correctionInstructions), so treating
+// every capitalized mid-sentence word as an untouchable possible name would
+// silently discard that judgment call and leave the mistake uncorrected.
+function isCapitalizationOnlyFix(original, replacement) {
+  return Boolean(original) && Boolean(replacement)
+    && original.toLowerCase() === replacement.toLowerCase()
+    && original !== replacement;
+}
+
 function filterProtectedProperNames(corrections, groups) {
   const protectedIds = new Set();
   const commonCapitalizedWords = new Set(["i"]);
@@ -1282,6 +1294,7 @@ function filterProtectedProperNames(corrections, groups) {
     });
   }
   return corrections.filter((item) => {
+    if (isCapitalizationOnlyFix(item.original, item.replacement)) return true;
     if (item.action === "replace") return !protectedIds.has(item.target_id);
     if (item.action === "rewrite_line") {
       return !(item.target_ids || []).some((id) => protectedIds.has(id));
@@ -3320,6 +3333,7 @@ module.exports = {
   sanitizeModelCapitalization,
   buildPunctuationCorrections,
   filterProtectedProperNames,
+  isCapitalizationOnlyFix,
   filterUnrenderableCorrections,
   groupOcrWordsIntoLines,
   lineClearlyContinues,
